@@ -9,12 +9,13 @@ runner, and installs it as an auto-restarting systemd service.
 
 ## Runner modes (`runner_mode`)
 
-Controlled by the `runner_mode` variable (default `persistent`):
+Controlled by the `runner_mode` variable (default `ephemeral` — GCE deployments
+are on-demand only, see the root README):
 
 | Mode | Behavior | Use when |
 |------|----------|----------|
-| **`persistent`** (default) | Registers and **stays available** across jobs. Installed as a systemd service that auto-restarts on crash and survives reboot. No `--ephemeral`, no self-deletion. `terraform apply` yields an Idle/online runner out of the box. | You want a standing runner that picks up jobs as they queue. |
-| **`ephemeral`** | One-shot. Registers with `--ephemeral`, runs exactly one job, then the VM self-deletes (watchdog with a hard max-lifetime catches hung jobs). | On-demand JIT runs; no idle VM left around. |
+| **`ephemeral`** (default) | One-shot. Registers with `--ephemeral`, runs exactly one job, then the VM self-deletes (watchdog with a hard max-lifetime catches hung jobs). | The default — on-demand JIT runs; no idle VM left around. |
+| **`persistent`** | Registers and **stays available** across jobs. Installed as a systemd service that auto-restarts on crash and survives reboot. No `--ephemeral`, no self-deletion. `terraform apply` yields an Idle/online runner out of the box. | Only if you deliberately want a standing runner — pair with a non-zero `runner_target_size` and be aware it bills continuously. |
 
 In both modes the runner registers with a stable name `gce-<instance_name>`
 and `--replace`, so re-applying replaces the same entry instead of failing on a
