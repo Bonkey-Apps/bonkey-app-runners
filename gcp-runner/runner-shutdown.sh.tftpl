@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Runner deregistration — GCE shutdown-script (Terraform template).
+#
+# Runs when the VM is shut down, preempted, or deleted (e.g. MIG scale-down or
+# Spot preemption). Best-effort: removes THIS VM's runner registration from
+# GitHub so a retired instance does not leave an offline "zombie" runner behind.
+#
+# Only ${github_api_scope} is interpolated by Terraform; every other $VAR is bash
+# and is intentionally written WITHOUT braces so templatefile() leaves it
+# untouched. github_api_scope is "orgs/<org>" for org-level runners or
+# "repos/<owner>/<repo>" for repo-scoped ones.
+# The PAT is read from the metadata server and never echoed.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+GITHUB_API_SCOPE="${github_api_scope}"
+META="http://metadata.google.internal/computeMetadata/v1"
+HDR="Metadata-Flavor: Google"
+
+# All progress goes to the serial console / journald under this tag so a silent
+# de-register failure (e.g. an under-scoped PAT returning 403) is visible in
+# `journalctl -t gh-runner-shutdown` instead of vanishing. The PAT itself is
+# NEVER logged — only HTTP status codes and runner ids.
+log() { logger -t gh-runner-shutdown -- "$*"; }
+
+PAT="$(curl -sf -H "$HDR" "$META/instance/attributes/github-runner-pat" 2>/dev/null || true)"
+NAME="$(curl -sf -H "$HDR" "$META/instance/name" 2>/dev/null || true)"
+[ -n "$PAT" ] || { log "no PAT in metadata; skipping deregister"; exit 0; }
+[ -n "$NAME" ] || { log "no instance name from metadata; skipping deregister"; exit 0; }
+# This VM may register MULTIPLE agents (gce-<NAME>, gce-<NAME>-2, …) so it can run
+# several jobs at once. Deregister ALL of them: the base name plus every -<n>
+# suffix. The instance name is unique in the MIG, so this prefix never matches
+# another VM's agents.
+RUNNER_NAME="gce-$NAME"
+log "deregistering runners named '$RUNNER_NAME' (and -N suffixes) from $GITHUB_API_SCOPE"
+
+# List this scope's runners, then delete every id whose name is the base name or
+# a '<base>-<n>' agent. Capture the HTTP status separately from the body so a
+# 401/403 (bad/under-scoped PAT) is surfaced rather than silently yielding no ids.
+LIST_BODY="$(curl -s -w '\n%%{http_code}' \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $PAT" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/$GITHUB_API_SCOPE/actions/runners?per_page=100")"
+LIST_CODE="$(printf '%s' "$LIST_BODY" | tail -n1)"
+LIST_JSON="$(printf '%s' "$LIST_BODY" | sed '$d')"
+
+if [ "$LIST_CODE" != "200" ]; then
+  log "list runners failed (HTTP $LIST_CODE) — check PAT scope (org 'Self-hosted runners' or repo Administration: read+write); leaving zombie runner"
+  exit 0
+fi
+
+# Match the exact base name OR "<base>-<digits>" (agents 2..N); a regex anchor
+# stops "gce-foo" from also matching an unrelated "gce-foobar".
+RIDS="$(printf '%s' "$LIST_JSON" \
+  | jq -r --arg n "$RUNNER_NAME" \
+    '.runners[] | select(.name == $n or (.name | test("^" + $n + "-[0-9]+$"))) | .id')"
+
+if [ -z "$RIDS" ]; then
+  log "no runners matching $RUNNER_NAME found in registration list; nothing to deregister"
+  exit 0
+fi
+
+for RID in $RIDS; do
+  [ -n "$RID" ] && [ "$RID" != "null" ] || continue
+  DEL_CODE="$(curl -s -o /dev/null -w '%%{http_code}' -X DELETE \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer $PAT" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/$GITHUB_API_SCOPE/actions/runners/$RID")"
+  if [ "$DEL_CODE" = "204" ]; then
+    log "deregistered runner id $RID"
+  else
+    log "delete runner id $RID failed (HTTP $DEL_CODE); leaving zombie runner"
+  fi
+done
+exit 0

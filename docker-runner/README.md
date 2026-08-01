@@ -1,0 +1,206 @@
+# Local Docker runner (Mac) — Bonkey-Apps org layer
+
+A containerised **self-hosted GitHub Actions runner** you can host from a Mac
+with Docker Desktop. It registers at the **organisation** layer
+(`https://github.com/Bonkey-Apps`), so it can serve CI for **any** Bonkey-Apps
+repo (Puzzles / Cards / Math), not just one.
+
+It bakes the **full CI toolchain** the three app repos install per job — pinned
+in lockstep with the self-hosted golden-image manifest
+([`gcp-runner/IMAGE-MANIFEST.md`](../gcp-runner/IMAGE-MANIFEST.md)) and
+each repo's `package.json` — so those `setup-*` steps become warm no-ops.
+
+> This directory is **infra/config only** (no `apps/**` / `packages/**` /
+> `tools/**` runtime surface), so the path-filtered product CI does not run on
+> changes to it — that's expected and test-exempt per CLAUDE.md.
+
+## Baked toolchain
+
+Pre-installed so per-job `setup-*` steps are warm no-ops (versions pinned to the
+golden-image manifest + each repo's `package.json`):
+
+| Layer | Contents | Notes |
+|---|---|---|
+| **CI (all repos, always)** | Node 24, **pnpm 10.33.0**, **Playwright 1.61.1** Chromium + OS libs (`/opt/pw-browsers`), GitHub CLI (`gh`), git, ripgrep, fd-find, jq, python3 | Serves typecheck / lint / format / `pnpm -r test` / web-export / Tier 3 web-local e2e / screenshots |
+| **Android build** (`INSTALL_ANDROID=true`, default) | OpenJDK 17, Android command-line tools + platform-tools + `platforms;android-34` + `build-tools;34.0.0` (`/opt/android-sdk`), **bundletool 1.18.1** (`/opt/bundletool`) | Serves Gradle `bundleRelease` (AAB) jobs. **amd64 only** — the Android SDK ships x86_64 host tools; set `INSTALL_ANDROID=false` on arm64 |
+
+## What it is / isn't
+
+| ✅ Runs here | ❌ Not here |
+|---|---|
+| typecheck, lint, format, `pnpm -r test` | **Android emulator / Maestro (Tier 4)** — needs `/dev/kvm`, which Docker Desktop on macOS does **not** expose. Keep those on the GCE `kvm`-labelled runners. |
+| `expo export -p web` + pack-diff oracle | **GPU / SDXL sprite-gen (diffusion) jobs** — graphics-env + NVIDIA-CUDA only; stays on the GCE graphics runner. |
+| Tier 3 web-local Playwright e2e (Chromium) | Anything requiring nested virtualisation or a real device |
+| Android **build** jobs — Gradle `bundleRelease` (no emulator) | |
+
+## Prerequisites
+
+- **Docker Desktop for Mac** (Apple Silicon or Intel).
+- On **Apple Silicon**, enable **Settings → General → "Use Rosetta for x86/amd64
+  emulation"** — the default build runs `linux/amd64` so the runner reports the
+  `x64` label the repo's jobs require (`runs-on: [self-hosted, linux, x64]`).
+- A GitHub **PAT with org runner-admin rights**:
+  - Classic: scope **`admin:org`**
+  - Fine-grained: Organization → **"Self-hosted runners" = Read and write**
+
+## Quick start
+
+The image is published to **GHCR** by
+[`build-docker-runner-image.yml`](../.github/workflows/build-docker-runner-image.yml)
+as `ghcr.io/bonkey-apps/bonkey-apps-runner:latest`, so you can pull it
+instead of building locally:
+
+```bash
+cd docker-runner
+cp .env.example .env
+# edit .env → set GH_PAT=...
+docker compose pull            # fetch the prebuilt, fully-baked image from GHCR
+docker compose up -d
+docker compose logs -f          # watch it register + pick up jobs
+```
+
+GHCR pull needs a one-time `docker login ghcr.io -u <you> -p <PAT-with-read:packages>`
+if the package is private. To rebuild the image locally instead of pulling
+(e.g. after editing the Dockerfile), use `docker compose up --build -d`, or point
+`RUNNER_IMAGE` in `.env` at a specific published tag.
+
+Confirm it's online:
+
+```bash
+# Org runners page: https://github.com/organizations/Bonkey-Apps/settings/actions/runners
+# or via API (needs the same PAT):
+curl -s -H "Authorization: Bearer $GH_PAT" \
+  https://api.github.com/orgs/Bonkey-Apps/actions/runners \
+  | jq '.runners[] | {name, status, labels: [.labels[].name]}'
+```
+
+Tear down (deregisters cleanly on stop):
+
+```bash
+docker compose down
+```
+
+## Local build (behind a corporate TLS-inspecting proxy)
+
+If your Mac sits behind a corporate proxy that MITMs HTTPS (Netskope, Zscaler,
+Palo Alto, etc. — check `security find-certificate -a
+/Library/Keychains/System.keychain` for names like your company's), the
+**committed** `Dockerfile` will fail: the container's OS trust store doesn't
+know about the proxy's re-signing CA that your Mac already trusts. Both apt/curl
+downloads at build time *and* the runner binary itself at runtime need this.
+`docker compose pull` (GHCR) sidesteps the problem entirely if the image is
+published — try that first.
+
+If you must build locally, **never edit the committed `Dockerfile`** with
+machine-specific trust — it's shared by the whole org and any dev without your
+proxy. Instead:
+
+1. Export your Mac's trusted root CAs to a local, gitignored file:
+   ```bash
+   security find-certificate -a -p /Library/Keychains/System.keychain \
+     > docker-runner/system-roots.pem.local-build-only
+   ```
+2. Copy `Dockerfile` → `Dockerfile.local` and add a CA-trust stage right after
+   the `ENV` block (before any `apt-get`/`curl`):
+   ```dockerfile
+   COPY system-roots.pem.local-build-only /usr/local/share/ca-certificates/local-system-roots.crt
+   RUN apt-get update -q \
+       && apt-get install -y -q --no-install-recommends ca-certificates \
+       && update-ca-certificates \
+       && rm -rf /var/lib/apt/lists/*
+   ```
+   (Also worth defaulting `ARG INSTALL_ANDROID=false` in `Dockerfile.local` —
+   `sdkmanager` is a JVM tool with its own trust store, unvalidated with this
+   fix.)
+3. Add `Dockerfile.local` and `system-roots.pem.local-build-only` to
+   `.git/info/exclude` (NOT `.gitignore` — this is a personal, per-machine
+   exclusion, not a repo-wide rule) so `git status` stays clean and neither
+   file is ever accidentally committed.
+4. Create `docker-runner/docker-compose.override.yml` (also
+   `.git/info/exclude`'d) so `docker compose up --build` / `docker compose
+   build` use `Dockerfile.local` automatically — no manual `-f` flag to
+   remember, and no risk of swapping files in place (which defeats the whole
+   point: the committed `Dockerfile` must stay portable):
+   ```yaml
+   services:
+     runner:
+       build:
+         dockerfile: Dockerfile.local
+   ```
+   Compose merges `docker-compose.override.yml` on top of `docker-compose.yml`
+   automatically — no `-f` flags needed on the CLI.
+
+**Why not just `curl -k` / disable TLS verification everywhere?** It covers
+apt/curl/npm at build time, but the actual runner process
+(`Runner.Listener`, a compiled .NET binary) validates TLS against the OS trust
+store at *runtime* to hold its connection to GitHub's Actions service, and
+has no insecure-mode flag — so `-k`-style flags alone leave the container
+completely unable to register or run jobs. Trusting the CA once, properly,
+is the only fix that works end-to-end.
+
+## How it works
+
+1. **`entrypoint.sh`** exchanges `GH_PAT` for a short-lived **org registration
+   token** at startup (the PAT is never written to disk), or uses a pre-minted
+   `RUNNER_TOKEN` if you set one instead.
+2. It runs `config.sh --url https://github.com/Bonkey-Apps … --ephemeral` then
+   `run.sh`.
+3. **Ephemeral by default** (`RUNNER_EPHEMERAL=true`): the runner takes exactly
+   one job, then exits; `restart: unless-stopped` brings up a fresh registration
+   for the next job. This mirrors the GCE ephemeral-JIT model (one clean
+   environment per job) and avoids stale state between runs.
+4. On `docker stop` / `SIGTERM` (or a non-ephemeral shutdown) the entrypoint
+   mints a **remove-token** and calls `config.sh remove`, so you don't leak
+   "offline" entries in the org runner list.
+
+Run **more than one** at a time for parallelism (one runner = one job at a time):
+
+```bash
+docker compose up --build -d --scale runner=3
+```
+
+## Configuration
+
+All via `.env` (see `.env.example` for the full annotated list):
+
+| Var | Default | Purpose |
+|---|---|---|
+| `GH_PAT` | — | Org runner-admin PAT (or use `RUNNER_TOKEN`) |
+| `RUNNER_TOKEN` | — | Pre-minted org registration token (alternative to `GH_PAT`) |
+| `GITHUB_ORG` | `Bonkey-Apps` | Org to register under |
+| `RUNNER_NAME` | `docker-mac-<rand>` | Runner name shown in settings |
+| `RUNNER_LABELS` | `docker,docker-mac,local` | Extra labels (arch `x64`/`arm64` is added automatically) |
+| `RUNNER_GROUP` | `Default` | Org runner group |
+| `RUNNER_EPHEMERAL` | `true` | One job then exit (recommended) |
+| `RUNNER_VERSION` | `2.335.1` | `actions/runner` version — keep in lockstep with the GCE runners |
+| `PNPM_VERSION` | `10.33.0` | Baked pnpm (== each repo's `packageManager`) |
+| `PLAYWRIGHT_VERSION` | `1.61.1` | Baked Playwright (== each repo's `@playwright/test`) |
+| `INSTALL_ANDROID` | `true` | Bake Java 17 + Android SDK + bundletool (amd64 only; `false` for lean/arm64) |
+| `RUNNER_PLATFORM` | `linux/amd64` | `linux/amd64` (→ `x64`) or `linux/arm64` |
+
+### amd64 vs arm64
+
+The repo's workflows target `runs-on: [self-hosted, linux, x64, …]`, so the
+default `linux/amd64` platform is what you want — it reports the `x64` label and
+jobs schedule onto it. Native `linux/arm64` is faster on Apple Silicon but only
+matches jobs that don't require `x64`; set `RUNNER_PLATFORM=linux/arm64` only if
+you know the target jobs allow it — and pair it with `INSTALL_ANDROID=false`,
+since the Android SDK ships x86_64 host tools only.
+
+## Security notes
+
+- `.env` is gitignored — **never commit a token**. `GH_PAT` is used only to mint
+  short-lived registration/remove tokens and is never persisted in the image or
+  a layer.
+- The runner runs as the non-root `runner` user inside the container.
+- Self-hosted runners execute arbitrary workflow code. Only register against
+  repos/orgs you trust; prefer **ephemeral** so each job starts clean.
+
+## Relationship to the GCE runners
+
+The GCE fleet (`gcp-runner/`) remains the primary, always-available CI
+capacity (persistent Spot VM + on-demand ephemeral JIT VMs), including the
+**Android/KVM** tier this container cannot serve. This local Docker runner is a
+**supplementary, zero-cloud-cost** option for burst capacity or offline/local
+CI from a Mac — it does not replace the GCE runners or change the GCP quota
+discipline in the root `CLAUDE.md`.
