@@ -18,6 +18,8 @@
 #     • Android command-line tools + platform-tools + platforms;android-34
 #       + build-tools;34.0.0 (licenses accepted)          → /opt/android-sdk
 #     • bundletool 1.18.1                                  → /opt/bundletool
+#     • Gradle wrapper distribution cache, pre-populated for GRADLE_VERSION
+#       (GRADLE_USER_HOME)                                 → /opt/gradle-cache
 #
 # Deliberately NOT baked (cannot run in Docker Desktop on macOS):
 #   • Android EMULATOR / Maestro (ADR 0008 Tier 4) — needs /dev/kvm, which
@@ -44,6 +46,12 @@ ARG ANDROID_CMDLINE_TOOLS=commandlinetools-linux-14742923_latest.zip
 ARG ANDROID_PLATFORM=android-34
 ARG ANDROID_BUILD_TOOLS=34.0.0
 ARG BUNDLETOOL_VERSION=1.18.1
+# Must track whatever `expo prebuild` pins in the generated
+# gradle/wrapper/gradle-wrapper.properties (currently 9.3.1, confirmed from a
+# live failure log — bonkey-cards-app#1032). Bump this in lockstep if that
+# drifts, or the pre-baked cache below goes stale and jobs fall back to a
+# network download.
+ARG GRADLE_VERSION=9.3.1
 # Populated automatically by BuildKit (amd64 / arm64).
 ARG TARGETARCH
 
@@ -149,12 +157,43 @@ RUN set -eux; \
         || { echo "openjdk-${JAVA_VERSION}-jdk-headless installed but 'java' is not on PATH — update-alternatives did not register it." >&2; exit 1; }; \
       java -version; \
       echo "JAVA_HOME will resolve to: $(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"; \
+      # Pre-bake the Gradle wrapper's OWN distribution cache (not just a
+      # standalone `gradle` binary) so `./gradlew` in the actual job finds it
+      # via the exact lookup a real distributionUrl produces — no network
+      # fetch needed at job time, matching what this layer already does for
+      # the Android command-line tools. We bootstrap with a throwaway Gradle
+      # install, use it to generate a real wrapper for GRADLE_VERSION (which
+      # writes the same https://services.gradle.org/... distributionUrl expo
+      # prebuild's generated wrapper will use), then let THAT wrapper do a
+      # real download into GRADLE_USER_HOME — so the cache directory hash is
+      # computed by Gradle's own code, not guessed at here.
+      GRADLE_ZIP="gradle-${GRADLE_VERSION}-bin.zip"; \
+      curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+        "https://services.gradle.org/distributions/${GRADLE_ZIP}" \
+        -o "/tmp/${GRADLE_ZIP}"; \
+      mkdir -p /tmp/gradle-boot; \
+      python3 -m zipfile -e "/tmp/${GRADLE_ZIP}" /tmp/gradle-boot/; \
+      # python3 -m zipfile does not preserve the Unix executable bit stored in
+      # the zip's external attributes (unlike `unzip`) — without this, the
+      # extracted `bin/gradle` launcher script fails with "Permission denied".
+      chmod +x "/tmp/gradle-boot/gradle-${GRADLE_VERSION}/bin/gradle"; \
+      mkdir -p /tmp/gradle-wrapper-project; \
+      (cd /tmp/gradle-wrapper-project && touch settings.gradle \
+        && "/tmp/gradle-boot/gradle-${GRADLE_VERSION}/bin/gradle" wrapper \
+             --gradle-version "${GRADLE_VERSION}" --distribution-type bin --no-daemon \
+        && GRADLE_USER_HOME=/opt/gradle-cache ./gradlew --version --no-daemon); \
+      rm -rf /tmp/gradle-boot /tmp/gradle-wrapper-project "/tmp/${GRADLE_ZIP}"; \
+      chown -R runner:runner /opt/gradle-cache; \
     else \
       echo "INSTALL_ANDROID=false — skipping Java/Android SDK/bundletool bake."; \
     fi
 
 # Android SDK on PATH (harmless when the layer was skipped).
 ENV PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}"
+
+# Points ./gradlew at the pre-baked wrapper cache above (harmless when the
+# layer was skipped — Gradle just falls back to a fresh $HOME/.gradle).
+ENV GRADLE_USER_HOME=/opt/gradle-cache
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
