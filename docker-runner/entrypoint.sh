@@ -42,6 +42,25 @@ RUNNER_REPLACE="${RUNNER_REPLACE:-true}"
 
 command -v jq >/dev/null || die "jq missing from image"
 
+# --- JAVA_HOME (only when a JDK is actually baked in) -----------------------
+# The Android layer (INSTALL_ANDROID=true) installs a JDK; the lean/arm64 image
+# deliberately does not. Deriving this at RUNTIME rather than as a Dockerfile
+# ENV gets both properties a static ENV cannot have at once:
+#
+#   • arch-correct — resolves to ...-amd64 or ...-arm64 from the real binary,
+#     rather than hard-coding one and being wrong on the other;
+#   • absent when there is no JDK — a JAVA_HOME that is SET but points nowhere
+#     is worse than none at all, because jobs skip `actions/setup-java` on the
+#     strength of it and would fail later, further from the cause.
+#
+# Jobs inherit this from the runner process, which is why it belongs here and
+# not in a login profile (Actions steps do not source one).
+if [ -z "${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
+  JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+  export JAVA_HOME
+  log "JAVA_HOME=${JAVA_HOME} (derived from the baked JDK)"
+fi
+
 # --- Resolve a registration token ------------------------------------------
 if [ -z "${RUNNER_TOKEN:-}" ]; then
   [ -n "${GH_PAT:-}" ] || die "provide GH_PAT (org runner admin) or RUNNER_TOKEN"

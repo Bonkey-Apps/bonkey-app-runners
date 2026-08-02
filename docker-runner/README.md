@@ -22,7 +22,7 @@ golden-image manifest + each repo's `package.json`):
 | Layer | Contents | Notes |
 |---|---|---|
 | **CI (all repos, always)** | Node 24, **pnpm 10.33.0**, **Playwright 1.61.1** Chromium + OS libs (`/opt/pw-browsers`), GitHub CLI (`gh`), git, ripgrep, fd-find, jq, python3 | Serves typecheck / lint / format / `pnpm -r test` / web-export / Tier 3 web-local e2e / screenshots |
-| **Android build** (`INSTALL_ANDROID=true`, default) | OpenJDK 17 with **`JAVA_HOME` exported** (so jobs can skip `actions/setup-java`), Android command-line tools + platform-tools + `platforms;android-34` + `build-tools;34.0.0` (`/opt/android-sdk`), **bundletool 1.18.1** (`/opt/bundletool`) | Serves Gradle `bundleRelease` (AAB) jobs. **amd64 only** — the Android SDK ships x86_64 host tools; set `INSTALL_ANDROID=false` on arm64 |
+| **Android build** (`INSTALL_ANDROID=true`, default) | OpenJDK 17 with **`JAVA_HOME` exported by `entrypoint.sh`** (so jobs can skip `actions/setup-java`; derived from the real `java`, so it is arch-correct and stays UNSET on a `INSTALL_ANDROID=false` image rather than pointing at a JDK that isn't there), Android command-line tools + platform-tools + `platforms;android-34` + `build-tools;34.0.0` (`/opt/android-sdk`), **bundletool 1.18.1** (`/opt/bundletool`) | Serves Gradle `bundleRelease` (AAB) jobs. **amd64 only** — the Android SDK ships x86_64 host tools; set `INSTALL_ANDROID=false` on arm64 |
 
 ## What it is / isn't
 
