@@ -14,7 +14,7 @@
 #     • Playwright 1.61.1 Chromium browser + its OS libs  → /opt/pw-browsers
 #     • GitHub CLI (gh), git, ripgrep, fd-find, jq, python3
 #   Android BUILD (INSTALL_ANDROID=true, default):
-#     • Temurin/OpenJDK 17
+#     • OpenJDK 17 (JAVA_HOME exported at runtime by entrypoint.sh)
 #     • Android command-line tools + platform-tools + platforms;android-34
 #       + build-tools;34.0.0 (licenses accepted)          → /opt/android-sdk
 #     • bundletool 1.18.1                                  → /opt/bundletool
@@ -139,6 +139,16 @@ RUN set -eux; \
         "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
         -o "${BUNDLETOOL_JAR}"; \
       chown -R runner:runner "${ANDROID_SDK_ROOT}" /opt/bundletool; \
+      # Fail the BAKE if the JDK we just installed is not actually runnable.
+      # entrypoint.sh derives JAVA_HOME from this `java` at RUNTIME, and jobs
+      # skip `actions/setup-java` on the strength of it — so a JDK that installs
+      # but does not resolve must fail here, loudly, rather than at the next
+      # release. Resolved via PATH (apt registers /usr/bin/java through
+      # update-alternatives), so this stays arch-agnostic.
+      command -v java >/dev/null \
+        || { echo "openjdk-${JAVA_VERSION}-jdk-headless installed but 'java' is not on PATH — update-alternatives did not register it." >&2; exit 1; }; \
+      java -version; \
+      echo "JAVA_HOME will resolve to: $(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"; \
     else \
       echo "INSTALL_ANDROID=false — skipping Java/Android SDK/bundletool bake."; \
     fi
