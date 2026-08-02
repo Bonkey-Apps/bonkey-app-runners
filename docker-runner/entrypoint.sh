@@ -65,23 +65,27 @@ if [ -z "${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
 fi
 
 # --- Native (ninja/CMake) build concurrency ---------------------------------
-# This is a property of the RUNNER (its CPU/memory ceiling and whatever else
-# shares the host), not of the app being built — every consumer doing an
-# Android native build needs the same tuning, and each was discovering it the
-# same expensive way (a version bump + full release run per data point).
-# Bonkey-cards-app#1032's evidence: uncapped concurrency died at 15m12s (8
-# orphaned clang++ at kill), --max-workers=4 died at 21m17s (5 orphaned).
-# 2 is the current best-evidence value on THIS container's allocation
-# (~9.7GB / 8 cores) — not yet confirmed sufficient, revisit if the host's
-# memory/CPU allocation changes or evidence says otherwise.
-# Overridable (`docker run -e BONKEY_NATIVE_BUILD_JOBS=N` or a bigger box);
-# consumers should read it with a fallback (`${BONKEY_NATIVE_BUILD_JOBS:-4}`)
-# so GitHub-hosted runners and any image predating this keep working.
+# CORRECTION, measured on bonkey-cards-app#1032 across 3 release runs / 3
+# --max-workers settings (uncapped, 4, 2): concurrent clang++ count never
+# moved. Android Gradle Plugin invokes ninja DIRECTLY, not through
+# `cmake --build` — so neither Gradle's --max-workers nor
+# CMAKE_BUILD_PARALLEL_LEVEL reach it. Ninja instead picks its own -j from
+# `nproc`, and Docker's time-quota `cpus:` does NOT change what nproc reports
+# inside a container (verified empirically) — only `cpuset:` (core pinning,
+# see docker-compose.yml) actually throttles it.
+#
+# BONKEY_NATIVE_BUILD_JOBS is still exported here — it's the right lever for
+# GRADLE's own task-level --max-workers (a real, separate, working knob), and
+# for any OTHER consumer whose native build goes through `cmake --build`
+# rather than AGP's direct ninja invocation. Just don't expect it to bound
+# ninja's own parallelism in an Expo/AGP build — that's docker-compose.yml's
+# `cpuset:` job now. Keep the default here in lockstep with however many
+# cores that pins (currently 2).
 BONKEY_NATIVE_BUILD_JOBS="${BONKEY_NATIVE_BUILD_JOBS:-2}"
 export BONKEY_NATIVE_BUILD_JOBS
 CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-${BONKEY_NATIVE_BUILD_JOBS}}"
 export CMAKE_BUILD_PARALLEL_LEVEL
-log "BONKEY_NATIVE_BUILD_JOBS=${BONKEY_NATIVE_BUILD_JOBS} (CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL})"
+log "BONKEY_NATIVE_BUILD_JOBS=${BONKEY_NATIVE_BUILD_JOBS} (CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}; note: neither reaches ninja under AGP's direct invocation — see docker-compose.yml's cpuset)"
 
 # --- Resolve a registration token ------------------------------------------
 if [ -z "${RUNNER_TOKEN:-}" ]; then

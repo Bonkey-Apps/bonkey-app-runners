@@ -177,7 +177,8 @@ All via `.env` (see `.env.example` for the full annotated list):
 | `PLAYWRIGHT_VERSION` | `1.61.1` | Baked Playwright (== each repo's `@playwright/test`) |
 | `INSTALL_ANDROID` | `true` | Bake Java 17 + Android SDK + bundletool (amd64 only; `false` for lean/arm64) |
 | `RUNNER_PLATFORM` | `linux/amd64` | `linux/amd64` (→ `x64`) or `linux/arm64` |
-| `BONKEY_NATIVE_BUILD_JOBS` | `2` | ninja/CMake concurrency cap for Android native builds, derived at runtime from this container's CPU/memory ceiling (see the export in `entrypoint.sh` for the evidence behind the default). Consuming workflows should read it (`--max-workers=${BONKEY_NATIVE_BUILD_JOBS:-4}`) instead of hardcoding a value. |
+| `RUNNER_CPUSET` | `0-1` (2 cores) | Pins the container to a core SET (`cpuset`, not a time-quota `cpus` limit) — this is the lever that actually throttles ninja's native-build concurrency in an Expo/AGP build, since AGP invokes ninja directly and ninja picks its own `-j` from `nproc`. Keep `BONKEY_NATIVE_BUILD_JOBS`'s default in lockstep with however many cores this pins. |
+| `BONKEY_NATIVE_BUILD_JOBS` | `2` | Gradle's own `--max-workers` cap (a real, separate, working knob) — does **not** bound ninja under AGP's direct invocation; that's `RUNNER_CPUSET`'s job. Useful for other consumers whose native build goes through `cmake --build` rather than AGP. See the export in `entrypoint.sh` for the full evidence trail. |
 
 ### amd64 vs arm64
 
