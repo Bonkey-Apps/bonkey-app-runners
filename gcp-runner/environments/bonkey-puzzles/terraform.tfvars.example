@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# terraform.tfvars.example — bonkey-puzzles free-tier runner
+#
+# Copy to terraform.tfvars (gitignored) or pass values via TF_VAR_* env vars.
+# NEVER commit terraform.tfvars — it contains secrets. The free-tier shape
+# (e2-micro / 30 GB pd-standard / us-central1 / persistent / target_size 1 /
+# labels / repo) is fixed in main.tf and is NOT overridable here.
+# ---------------------------------------------------------------------------
+
+# -------------------------
+# Required — no default
+# -------------------------
+project_id = "your-gcp-project-id"
+
+# github_runner_pat is sensitive — DO NOT write it here. Provide it from Secret
+# Manager via an env var instead:
+#   unset CLOUDSDK_AUTH_ACCESS_TOKEN   # if a stale token is exported
+#   export TF_VAR_github_runner_pat="$(gcloud secrets versions access latest \
+#     --secret=bonkey-puzzles-runner-pat --project=YOUR_PROJECT_ID)"
+#
+# This MUST be a bonkey-puzzles-scoped fine-grained PAT with
+# Administration: Read & Write. The bonkey-puzzles-app GH_RUNNER_PAT will NOT work.
+
+# -------------------------
+# Optional overrides (defaults are free-tier safe; normally leave unset)
+# -------------------------
+# region = "us-central1"     # Always Free regions: us-west1, us-central1, us-east1
+# zone   = "us-central1-a"
+
+# Leave service_account_email empty to create a dedicated SA, or set it to an
+# SA pre-created out of band if the provisioning identity cannot create SAs.
+# service_account_email = "gh-runner-sa@your-gcp-project-id.iam.gserviceaccount.com"
+
+# Flip these on ONLY if the provisioning identity holds the matching admin role
+# (serviceUsageAdmin / projectIamAdmin). Default OFF assumes out-of-band setup.
+# manage_project_services = true
+# manage_project_iam      = true

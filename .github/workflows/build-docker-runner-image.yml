@@ -1,0 +1,96 @@
+name: build-docker-runner-image
+
+# Builds the local/Mac self-hosted runner image (docker-runner/Dockerfile)
+# and publishes it to GitHub Container Registry (GHCR), so a Mac can
+# `docker pull` the fully-baked runner instead of building it locally.
+#
+# Mirrors build-ci-image.yml: raw `docker` CLI (no third-party actions) to stay
+# trivially within the repo's Actions security policy — the only action here is
+# the first-party actions/checkout.
+#
+# Built linux/amd64 so the runner reports the `x64` label the app repos' jobs
+# require (on Apple Silicon it runs under Rosetta). INSTALL_ANDROID bakes the
+# Java 17 + Android SDK + bundletool build toolchain (amd64 only); toggle it off
+# via the workflow_dispatch input for a lean JS/web-only image.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker-runner/**"
+      - ".github/workflows/build-docker-runner-image.yml"
+  workflow_dispatch:
+    inputs:
+      install_android:
+        description: "Bake the Java/Android-SDK/bundletool build toolchain (amd64 only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # Mirrors the repo's CI_RUNNER default. NOTE: the chosen runner must have
+    # Docker available (a bare self-hosted runner needs docker installed).
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["self-hosted","linux","x64","gce-c3-spot"]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compute image name + tags
+        id: img
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # Fixed name, NOT derived from github.repository: this image is an
+          # ORG-level runner shared by all three Bonkey apps (Puzzles / Cards /
+          # Math), not scoped to whichever repo happens to host the workflow —
+          # naming it after this repo would be misleading.
+          name="ghcr.io/bonkey-apps/bonkey-apps-runner"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Build image
+        env:
+          NAME: ${{ steps.img.outputs.name }}
+          SHA: ${{ steps.img.outputs.sha }}
+          # Defaults to true on a push (inputs is empty); the dispatch input can override.
+          INSTALL_ANDROID: ${{ github.event.inputs.install_android || 'true' }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "INSTALL_ANDROID=$INSTALL_ANDROID" \
+            -f docker-runner/Dockerfile \
+            -t "$NAME:latest" \
+            -t "$NAME:$SHA" \
+            docker-runner
+
+      - name: Push image
+        env:
+          NAME: ${{ steps.img.outputs.name }}
+          SHA: ${{ steps.img.outputs.sha }}
+        run: |
+          docker push "$NAME:latest"
+          docker push "$NAME:$SHA"
+
+      - name: Summary
+        env:
+          NAME: ${{ steps.img.outputs.name }}
+          SHA: ${{ steps.img.outputs.sha }}
+        run: |
+          {
+            echo "### Runner image published"
+            echo ""
+            echo "- \`$NAME:latest\`"
+            echo "- \`$NAME:$SHA\`"
+            echo ""
+            echo "Pull on a Mac: \`docker pull $NAME:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

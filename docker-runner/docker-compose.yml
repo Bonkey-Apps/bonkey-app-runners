@@ -1,0 +1,37 @@
+# Bonkey Apps — local (Mac) self-hosted org runner.
+#
+#   cp .env.example .env   # fill in GH_PAT
+#   docker compose up --build -d
+#   docker compose logs -f
+#
+# Default platform is linux/amd64 so the runner reports `x64` and matches the
+# repo's `runs-on: [self-hosted, linux, x64]` jobs. On Apple Silicon this runs
+# under Rosetta (enable "Use Rosetta" in Docker Desktop → Settings → General).
+# To run native arm64 instead, set RUNNER_PLATFORM=linux/arm64 in .env — but
+# note x64-only jobs then won't schedule on it.
+services:
+  runner:
+    build:
+      context: .
+      args:
+        RUNNER_VERSION: ${RUNNER_VERSION:-2.335.1}
+        PNPM_VERSION: ${PNPM_VERSION:-10.33.0}
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.61.1}
+        # Bake the Java/Android-SDK/bundletool build toolchain (amd64 only).
+        # Set false in .env for a lean JS/web-only image or an arm64 build.
+        INSTALL_ANDROID: ${INSTALL_ANDROID:-true}
+    # Published to GHCR by .github/workflows/build-docker-runner-image.yml.
+    # `docker compose pull` fetches this prebuilt image; `up --build` rebuilds
+    # it locally under the same tag.
+    image: ${RUNNER_IMAGE:-ghcr.io/bonkey-apps/bonkey-apps-runner:latest}
+    platform: ${RUNNER_PLATFORM:-linux/amd64}
+    # Ephemeral runners exit after one job; restart to pick up the next.
+    restart: ${RUNNER_RESTART:-unless-stopped}
+    stop_grace_period: 90s
+    env_file:
+      - .env
+    environment:
+      GITHUB_ORG: ${GITHUB_ORG:-Bonkey-Apps}
+      RUNNER_LABELS: ${RUNNER_LABELS:-docker,docker-mac,local}
+      RUNNER_GROUP: ${RUNNER_GROUP:-Default}
+      RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-true}

@@ -1,0 +1,809 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# GitHub Actions self-hosted runner — GCE startup script (Terraform template)
+#
+# Variables injected by Terraform templatefile():
+#   runner_version   — e.g. "2.335.1"
+#   runner_arch      — "x64" (Intel/AMD) or "arm64" (Arm)
+#   github_scope_url — config.sh --url target: an ORG url
+#                      (https://github.com/<org>) or a REPO url
+#                      (https://github.com/<owner>/<repo>).
+#   github_api_scope — api.github.com path segment for the registration-token
+#                      mint: "orgs/<org>" or "repos/<owner>/<repo>".
+#   runner_labels    — comma-separated, e.g. "self-hosted,linux,x64,gce-free"
+#   runner_mode      — "persistent" (stays available) or "ephemeral" (one-shot)
+#   instance_name    — GCE instance name (used for a stable runner name)
+#   enable_android   — "true"/"false"; when true, set up KVM so the Android
+#                      emulator can hardware-accelerate (needs nested virt on an
+#                      Intel non-E2 machine), plus a JDK for Gradle.
+#   runners_per_vm   — how many runner agents to register on this VM = how many
+#                      REGULAR jobs it runs concurrently. Emulator jobs are not
+#                      clamped here; they serialize at runtime via the host
+#                      readers/writer lock (see the job-hook section below).
+#
+# Secrets read from GCE instance metadata at runtime (NEVER from env/args):
+#   github-runner-pat — fine-grained PAT with repo Administration read+write
+#
+# Modes:
+#   persistent — registers, installs a systemd service that auto-restarts and
+#                survives reboot, and STAYS available across jobs. No --ephemeral,
+#                no self-deletion. (default)
+#   ephemeral  — registers with --ephemeral, runs one job, then the VM
+#                self-deletes via a watchdog.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+RUNNER_VERSION="${runner_version}"
+RUNNER_ARCH="${runner_arch}"
+GITHUB_SCOPE_URL="${github_scope_url}"
+GITHUB_API_SCOPE="${github_api_scope}"
+RUNNER_LABELS="${runner_labels}"
+RUNNER_MODE="${runner_mode}"
+INSTANCE_NAME_TPL="${instance_name}"
+ENABLE_ANDROID="${enable_android}"
+# How many runner agents to register on this VM = how many REGULAR jobs it runs at
+# once. Emulator jobs are serialized at runtime by the host lock, not by reducing
+# this count.
+RUNNERS_PER_VM="${runners_per_vm}"
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+log() { echo "[runner-startup] $*"; }
+die() {
+  echo "[runner-startup] FATAL: $*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Baked-toolchain env accumulator (#267 bake-list). Each toolchain bake below
+# appends the KEY=VALUE lines a job needs to SEE the pre-installed tool (e.g. a
+# shared PLAYWRIGHT_BROWSERS_PATH or ANDROID_SDK_ROOT). The per-agent config loop
+# merges this file into EVERY runner agent's .env (idempotently), so a baked tool
+# is discovered by every job on the VM and the workflow's inline install no-ops.
+# Rebuilt from scratch on each boot; the merge de-dupes, so reboots never
+# duplicate lines.
+# ---------------------------------------------------------------------------
+BAKED_ENV_FILE="/opt/runner-baked.env"
+mkdir -p /opt
+: > "$BAKED_ENV_FILE"
+bake_env() { echo "$1=$2" >> "$BAKED_ENV_FILE"; }
+
+# ---------------------------------------------------------------------------
+# Fetch secrets from the GCE metadata server.
+# The PAT is NEVER echoed, logged, or written to disk.
+# ---------------------------------------------------------------------------
+METADATA_BASE="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
+METADATA_HEADER="Metadata-Flavor: Google"
+
+fetch_metadata() {
+  curl -sf -H "$METADATA_HEADER" "$METADATA_BASE/$1"
+}
+
+# Floor at 1 so a bad/empty value never yields zero agents. Emulator jobs are NOT
+# clamped here — every VM gets the same agent count; an emulator job serializes at
+# RUNTIME via the host readers/writer lock installed below.
+if ! [[ "$RUNNERS_PER_VM" =~ ^[0-9]+$ ]] || [[ "$RUNNERS_PER_VM" -lt 1 ]]; then
+  log "runners_per_vm='$RUNNERS_PER_VM' is invalid; defaulting to 1."
+  RUNNERS_PER_VM=1
+fi
+
+log "Runner mode: $RUNNER_MODE"
+log "Concurrent job slots (runner agents) on this VM: $RUNNERS_PER_VM"
+log "Fetching runner config from instance metadata..."
+GH_PAT="$(fetch_metadata github-runner-pat)"
+# Validate the PAT was retrieved (do not print it)
+[[ -n "$GH_PAT" ]] || die "github-runner-pat metadata key is empty"
+
+# ---------------------------------------------------------------------------
+# System dependencies
+# ---------------------------------------------------------------------------
+log "Installing system dependencies..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q \
+  curl \
+  wget \
+  jq \
+  git \
+  zip \
+  unzip \
+  xz-utils \
+  tar \
+  file \
+  rsync \
+  build-essential \
+  python3 \
+  python3-pip \
+  python3-venv \
+  pipx \
+  shellcheck \
+  libicu72 \
+  libssl3 \
+  ca-certificates \
+  sudo \
+  gnupg
+
+# Node 24 (LTS)
+log "Installing Node.js 24..."
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+apt-get install -y -q nodejs
+node --version
+
+# pnpm — pin to the repo's packageManager version, NOT @latest. A newer global
+# pnpm (e.g. v11) fights the pinned pnpm@10.33.0: pnpm/action-setup then tries to
+# "switch" versions and, with multiple agents sharing $HOME, races/crashes. CI's
+# setup-js prefers this on-box pnpm when it matches, so keep it in lockstep with
+# package.json "packageManager".
+log "Installing pnpm..."
+npm install -g pnpm@10.33.0
+pnpm --version
+
+# Playwright system deps (for Chromium)
+log "Installing Playwright system dependencies..."
+npx -y playwright@latest install-deps chromium || true
+
+# ---------------------------------------------------------------------------
+# GitHub CLI (`gh`) bake (#262 — "fold into the runner image"). The bare Debian
+# runner ships no gh; ci-pages-deploy, the dev-release publish job, and the
+# ./.github/actions/ensure-gh composite all need it. Baking it makes that
+# composite a fast no-op. errexit off so a transient apt/network failure can
+# NEVER abort boot — the per-job composite covers any gap.
+# ---------------------------------------------------------------------------
+log "Installing GitHub CLI (gh)..."
+set +e
+if ! command -v gh >/dev/null 2>&1; then
+  mkdir -p -m 755 /etc/apt/keyrings
+  if curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg; then
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list
+    apt-get update -q && apt-get install -y -q gh \
+      || log "WARN: gh install failed — ensure-gh composite will cover it per job."
+  else
+    log "WARN: could not fetch gh apt keyring — ensure-gh composite will cover it per job."
+  fi
+fi
+command -v gh >/dev/null 2>&1 && gh --version || true
+set -e
+
+# ---------------------------------------------------------------------------
+# Docker Engine bake — needed to run build-docker-runner-image.yml (publishes
+# the local/Mac runner image, docker-runner/) and any other job that
+# shells out to `docker`. Debian's own repo package (no extra keyring/repo to
+# manage); errexit off so a transient apt/network failure can never abort
+# boot — a job that actually needs docker will fail loudly on its own step.
+# ---------------------------------------------------------------------------
+log "Installing Docker..."
+set +e
+if ! command -v docker >/dev/null 2>&1; then
+  apt-get install -y -q docker.io \
+    || log "WARN: docker.io install failed — jobs needing docker will fail their own step."
+fi
+if command -v docker >/dev/null 2>&1; then
+  systemctl enable --now docker 2>/dev/null || true
+  docker --version || true
+else
+  log "WARN: docker still not present after install attempt."
+fi
+set -e
+# NOTE: the Playwright-browser and Android-SDK bakes live below (after the runner
+# user is created) because they chown their shared caches to "$RUNNER_USER".
+
+# ---------------------------------------------------------------------------
+# Android build + emulator host setup (only when enable_android = true).
+#
+# We deliberately install ONLY the host prerequisites here:
+#   - KVM (qemu-kvm) so the Android emulator can hardware-accelerate. This needs
+#     nested virtualization, which Terraform enables via
+#     advanced_machine_features { enable_nested_virtualization = true } on an
+#     Intel non-E2 machine. If /dev/kvm is absent we die loudly.
+#   - A JDK (Temurin/OpenJDK 17) for Gradle.
+# The Android SDK, system images and AVD are provisioned per-job by the workflow
+# (e.g. android-actions/setup-android + reactivecircus/android-emulator-runner),
+# which only requires a working /dev/kvm on the host — keeping this script lean.
+# ---------------------------------------------------------------------------
+if [[ "$ENABLE_ANDROID" == "true" ]]; then
+  log "Android profile: installing KVM + JDK host prerequisites..."
+  apt-get install -y -q qemu-kvm openjdk-17-jdk-headless
+
+  # Ensure the kvm group exists and the kvm modules are loaded.
+  groupadd -f kvm
+  modprobe kvm 2>/dev/null || true
+  modprobe kvm_intel 2>/dev/null || true
+
+  if [[ ! -e /dev/kvm ]]; then
+    die "/dev/kvm is not present. The Android emulator needs KVM. Confirm the VM is an Intel non-E2 machine with enable_nested_virtualization = true."
+  fi
+  # Make /dev/kvm group-accessible so the (non-root) runner user can use it.
+  chgrp kvm /dev/kvm || true
+  chmod 660 /dev/kvm || true
+  log "KVM is available at /dev/kvm — emulator can hardware-accelerate."
+fi
+
+# ---------------------------------------------------------------------------
+# Create a non-root runner user
+# ---------------------------------------------------------------------------
+RUNNER_USER="runner"
+RUNNER_HOME="/home/$RUNNER_USER"
+RUNNER_DIR="$RUNNER_HOME/actions-runner"
+
+if ! id "$RUNNER_USER" &>/dev/null; then
+  useradd -m -s /bin/bash "$RUNNER_USER"
+fi
+
+# Passwordless sudo for the runner user. CI jobs need root for system-package
+# installs that GitHub-hosted runners get for free — e.g.
+# `playwright install --with-deps` (Chromium libs), `apt-get install`, and the
+# Android emulator's `chmod /dev/kvm`. Self-hosted CI runners conventionally run
+# with NOPASSWD sudo; this VM is outbound-only (deny-ingress firewall) and Spot
+# (recreatable), so the blast radius is contained. NOTE: only safe because PRs
+# come from trusted members of a private repo — revisit if external forks can
+# trigger runs.
+echo "$RUNNER_USER ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/runner-nopasswd
+chmod 440 /etc/sudoers.d/runner-nopasswd
+# Validate the sudoers file; remove it if malformed so a typo can't lock sudo.
+visudo -cf /etc/sudoers.d/runner-nopasswd || rm -f /etc/sudoers.d/runner-nopasswd
+
+# Grant the runner user access to /dev/kvm for the Android emulator.
+if [[ "$ENABLE_ANDROID" == "true" ]]; then
+  usermod -aG kvm "$RUNNER_USER"
+fi
+
+# Let the runner user run `docker` without sudo (NOPASSWD sudo above already
+# covers it, but jobs shell out to bare `docker ...` — group membership avoids
+# needing `sudo` in every job step). No-op if docker.io failed to install.
+if getent group docker >/dev/null 2>&1; then
+  usermod -aG docker "$RUNNER_USER"
+fi
+
+# Install gcloud CLI (needed for self-deletion in ephemeral mode)
+log "Installing gcloud CLI..."
+if ! command -v gcloud &>/dev/null; then
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    >/etc/apt/sources.list.d/google-cloud-sdk.list
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  apt-get update -q
+  apt-get install -y -q google-cloud-cli
+fi
+
+# ---------------------------------------------------------------------------
+# Google Cloud Ops Agent (#408) — host metrics + syslog into Cloud Monitoring /
+# Cloud Logging (there is no host monitoring today). Installed idempotently and
+# BEFORE the runner registers below, so a job's console output is already being
+# captured by the time it starts. Requires the runner SA to hold
+# roles/monitoring.metricWriter + roles/logging.logWriter (granted in main.tf)
+# and monitoring.googleapis.com / logging.googleapis.com enabled (apis.tf).
+# errexit off: a transient network/apt failure here must never abort boot — the
+# runner still comes up (just unmonitored) and a later boot retries the install.
+# ---------------------------------------------------------------------------
+log "Installing Google Cloud Ops Agent..."
+set +e
+if dpkg -s google-cloud-ops-agent >/dev/null 2>&1; then
+  log "Google Cloud Ops Agent already installed — skipping (idempotent)."
+else
+  OPS_AGENT_SCRIPT="/tmp/add-google-cloud-ops-agent-repo.sh"
+  if curl -sS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o "$OPS_AGENT_SCRIPT"; then
+    sudo bash "$OPS_AGENT_SCRIPT" --also-install \
+      || log "WARN: Google Cloud Ops Agent install failed — runner still comes up without it."
+    rm -f "$OPS_AGENT_SCRIPT"
+  else
+    log "WARN: could not fetch the Ops Agent install script — runner still comes up without it."
+  fi
+fi
+if systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
+  log "Google Cloud Ops Agent is active."
+else
+  log "WARN: Google Cloud Ops Agent is not active (see install output above)."
+fi
+set -e
+
+# ---------------------------------------------------------------------------
+# Download the actions/runner agent (once; extracted into each agent's dir below)
+# ---------------------------------------------------------------------------
+log "Downloading actions/runner v$RUNNER_VERSION ($RUNNER_ARCH)..."
+RUNNER_PKG="actions-runner-linux-$RUNNER_ARCH-$RUNNER_VERSION.tar.gz"
+RUNNER_URL="https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/$RUNNER_PKG"
+
+curl -fsSL "$RUNNER_URL" -o "/tmp/$RUNNER_PKG"
+
+# ---------------------------------------------------------------------------
+# Playwright Chromium browser bake (#267). Pre-fetch the browser binary into a
+# shared, runner-owned PLAYWRIGHT_BROWSERS_PATH so the per-job
+# `playwright install chromium` (ci-web-e2e + ci-screenshots) becomes a fast
+# no-op. Pinned to the repos' @playwright/test version (all three pin 1.61.1);
+# the fetched revision is keyed to it, so a match means zero per-job download.
+# Idempotent via a per-version marker; errexit off so a fetch failure can't abort
+# boot.
+# ---------------------------------------------------------------------------
+set +e
+PLAYWRIGHT_VERSION="1.61.1"
+PW_BROWSERS_DIR="/opt/pw-browsers"
+PW_MARKER="$PW_BROWSERS_DIR/.baked-$PLAYWRIGHT_VERSION"
+log "Baking Playwright Chromium browser (v$PLAYWRIGHT_VERSION) into $PW_BROWSERS_DIR..."
+mkdir -p "$PW_BROWSERS_DIR"
+chown "$RUNNER_USER:$RUNNER_USER" "$PW_BROWSERS_DIR"
+if [[ -f "$PW_MARKER" ]]; then
+  log "Playwright Chromium v$PLAYWRIGHT_VERSION already baked — skipping."
+elif sudo -u "$RUNNER_USER" -H env "PLAYWRIGHT_BROWSERS_PATH=$PW_BROWSERS_DIR" \
+       npx -y "playwright@$PLAYWRIGHT_VERSION" install chromium; then
+  touch "$PW_MARKER"
+  log "Playwright Chromium baked OK."
+else
+  log "WARN: Playwright Chromium bake failed — per-job 'playwright install chromium' will cover it."
+fi
+chown -R "$RUNNER_USER:$RUNNER_USER" "$PW_BROWSERS_DIR" || true
+bake_env PLAYWRIGHT_BROWSERS_PATH "$PW_BROWSERS_DIR"
+set -e
+
+# ---------------------------------------------------------------------------
+# Android SDK + emulator system-image bake (enable_android only; #262/#267).
+# Pre-install the Android command-line SDK, platform-tools, the API-34 platform +
+# build-tools, the emulator, and the exact system image the Maestro tier boots
+# (system-images;android-34;google_apis;x86_64 — matches android-emulator-runner's
+# api-level 34 / google_apis / x86_64). Turns setup-android-build AND
+# android-emulator-runner's SDK install into a warm no-op (both honor
+# ANDROID_SDK_ROOT/ANDROID_HOME, exported below). Runner-owned at /opt/android-sdk
+# so jobs can write licenses/extra packages; AGP still auto-downloads any extra
+# platform/build-tools a project declares. Idempotent; errexit off so a failed
+# download can't abort boot. APPLY-TIME-UNVERIFIED (no Android SDK/KVM in CI).
+# ---------------------------------------------------------------------------
+if [[ "$ENABLE_ANDROID" == "true" ]]; then
+  log "Android profile: baking Android SDK + emulator system image. APPLY-TIME-UNVERIFIED."
+  set +e
+  ANDROID_SDK_ROOT="/opt/android-sdk"
+  ANDROID_CMDLINE_DIR="$ANDROID_SDK_ROOT/cmdline-tools/latest"
+  ANDROID_CMDLINE_ZIP="commandlinetools-linux-14742923_latest.zip"
+  mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+  if [[ ! -x "$ANDROID_CMDLINE_DIR/bin/sdkmanager" ]]; then
+    android_tmp="$(mktemp -d)"
+    if curl -fL --retry 5 --retry-all-errors --retry-delay 3 \
+        "https://dl.google.com/android/repository/$ANDROID_CMDLINE_ZIP" \
+        -o "$android_tmp/cmdline-tools.zip"; then
+      python3 -m zipfile -e "$android_tmp/cmdline-tools.zip" "$android_tmp/" \
+        && rm -rf "$ANDROID_CMDLINE_DIR" \
+        && mv "$android_tmp/cmdline-tools" "$ANDROID_CMDLINE_DIR" \
+        && chmod -R +x "$ANDROID_CMDLINE_DIR/bin" \
+        || log "WARN: Android cmdline-tools extract failed — setup-android-build covers it per job."
+    else
+      log "WARN: Android cmdline-tools download failed — setup-android-build covers it per job."
+    fi
+    rm -rf "$android_tmp"
+  else
+    log "Android command-line tools already baked — reusing."
+  fi
+  if [[ -x "$ANDROID_CMDLINE_DIR/bin/sdkmanager" ]]; then
+    set +o pipefail
+    yes 2>/dev/null | "$ANDROID_CMDLINE_DIR/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null 2>&1 || true
+    yes 2>/dev/null | "$ANDROID_CMDLINE_DIR/bin/sdkmanager" --sdk_root="$ANDROID_SDK_ROOT" \
+      "platform-tools" \
+      "platforms;android-34" \
+      "build-tools;34.0.0" \
+      "emulator" \
+      "system-images;android-34;google_apis;x86_64" >/dev/null 2>&1 \
+      || log "WARN: Android SDK package bake had issues — per-job install covers gaps. APPLY-TIME-UNVERIFIED."
+    set -o pipefail
+  fi
+  chown -R "$RUNNER_USER:$RUNNER_USER" "$ANDROID_SDK_ROOT" || true
+  bake_env ANDROID_SDK_ROOT "$ANDROID_SDK_ROOT"
+  bake_env ANDROID_HOME "$ANDROID_SDK_ROOT"
+  set -e
+  log "Android SDK baked at $ANDROID_SDK_ROOT (exported ANDROID_SDK_ROOT/ANDROID_HOME to jobs)."
+fi
+
+# ---------------------------------------------------------------------------
+# Mint a registration token from the GitHub API.
+# The PAT is used only here; the registration token is short-lived (~60 min).
+# ---------------------------------------------------------------------------
+log "Minting registration token from GitHub API..."
+# Capture status + headers separately so a 403 reports WHY (SSO unauthorized vs
+# missing scope vs not-an-admin) instead of an opaque empty token. The PAT is
+# never logged; only status codes, the diagnostic headers, and the error body
+# (a 403 body contains no token).
+MINT_HDR="/tmp/mint_hdr.$$"
+MINT_BODY="/tmp/mint_body.$$"
+MINT_CODE="$(
+  curl -s -D "$MINT_HDR" -o "$MINT_BODY" -w '%%{http_code}' \
+    -X POST \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer $GH_PAT" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/$GITHUB_API_SCOPE/actions/runners/registration-token"
+)"
+if [[ "$MINT_CODE" != "201" ]]; then
+  log "Mint FAILED for $GITHUB_API_SCOPE: HTTP $MINT_CODE"
+  log "  $(grep -i '^x-github-sso:' "$MINT_HDR" || echo 'x-github-sso: (none)')"
+  log "  $(grep -i '^x-accepted-github-permissions:' "$MINT_HDR" || echo 'x-accepted-github-permissions: (none)')"
+  log "  $(grep -i '^x-oauth-scopes:' "$MINT_HDR" || echo 'x-oauth-scopes: (none)')"
+  log "  $(grep -i '^x-ratelimit-remaining:' "$MINT_HDR" || echo 'x-ratelimit-remaining: (none)')"
+  RL_RESET="$(grep -i '^x-ratelimit-reset:' "$MINT_HDR" | tr -dc '0-9')"
+  if [[ -n "$RL_RESET" ]]; then
+    log "  x-ratelimit-reset: $RL_RESET ($(date -u -d "@$RL_RESET" '+%Y-%m-%d %H:%M:%S UTC'))"
+  fi
+  log "  body: $(tr -d '\n' < "$MINT_BODY" | cut -c1-300)"
+  rm -f "$MINT_HDR" "$MINT_BODY"
+  die "Failed to mint runner registration token (HTTP $MINT_CODE) — see headers logged above."
+fi
+REGISTRATION_TOKEN="$(jq -r '.token' < "$MINT_BODY")"
+rm -f "$MINT_HDR" "$MINT_BODY"
+[[ -n "$REGISTRATION_TOKEN" && "$REGISTRATION_TOKEN" != "null" ]] \
+  || die "Mint returned 201 but no token field — unexpected API response."
+
+# Keep the PAT a little longer ONLY if we need a removal token later (ephemeral
+# self-deregistration is handled by --ephemeral; persistent de-register is on
+# terraform destroy). We clear the PAT now since neither path needs it again.
+GH_PAT=""
+unset GH_PAT
+
+# ---------------------------------------------------------------------------
+# Host readers/writer lock — installed as runner per-job hooks.
+#
+# Every VM runs RUNNERS_PER_VM agents. Regular jobs take a SHARED lock (up to
+# RUNNERS_PER_VM at once); an emulator job — which declares itself with the
+# job-level env HOST_LOCK_MODE=exclusive — takes an EXCLUSIVE lock: it waits for
+# in-flight regular jobs on this VM to drain, then blocks the other agents from
+# starting new jobs until it finishes (writer-preference). That is why emulator
+# jobs need no provisioning-time clamp — KVM contention is resolved at runtime.
+#
+# The hooks fire via ACTIONS_RUNNER_HOOK_JOB_STARTED / _COMPLETED (set in each
+# agent's .env below). State lives in tmpfs (/run) so a reboot clears any leak,
+# and a hard wait cap stops a crashed hook from wedging CI forever.
+# ---------------------------------------------------------------------------
+HOOKS_DIR="/opt/runner-hooks"
+HOSTLOCK_STARTED="$HOOKS_DIR/job-started.sh"
+HOSTLOCK_COMPLETED="$HOOKS_DIR/job-completed.sh"
+mkdir -p "$HOOKS_DIR"
+
+cat > "$HOOKS_DIR/hostlock-lib.sh" <<'HOSTLOCK_LIB_EOF'
+#!/usr/bin/env bash
+# Host readers/writer lock shared by the runner job hooks. Regular jobs take a
+# shared lock (up to N at once); an emulator job (HOST_LOCK_MODE=exclusive) takes
+# an exclusive lock that waits for in-flight regular jobs on THIS VM to drain,
+# then blocks new jobs until it finishes. Writer-preference: once an emulator job
+# is waiting, new regular jobs block too. State is in tmpfs; timeouts prevent a
+# crashed hook from wedging CI. No 'set -e/-u' — a hook must never abort a job.
+set -o pipefail
+
+HL_STATE=/run/runner-hostlock
+HL_CTL="$HL_STATE/ctl"
+HL_READERS="$HL_STATE/readers"
+HL_WRITER="$HL_STATE/writer"
+HL_WAITING="$HL_STATE/writers_waiting"
+HL_POLL=2
+HL_MAX_WAIT=3600
+
+hl_log() { echo "[host-job-lock] $*"; }
+
+hl_init() {
+  mkdir -p "$HL_STATE" 2>/dev/null || true
+  [ -f "$HL_READERS" ] || echo 0 > "$HL_READERS"
+  [ -f "$HL_WAITING" ] || echo 0 > "$HL_WAITING"
+  [ -e "$HL_CTL" ] || : > "$HL_CTL"
+}
+
+# Read an integer state file, defaulting a missing/garbage value to 0.
+hl_int() { local v; v="$(cat "$1" 2>/dev/null)"; case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+
+# exclusive only when explicitly requested; anything else is a shared job.
+hl_mode() {
+  local m; m="$(printf '%s' "$HOST_LOCK_MODE" 2>/dev/null | tr 'A-Z' 'a-z')"
+  case "$m" in
+    exclusive|writer|emulator) echo exclusive ; return ;;
+    none|off|skip) echo none ; return ;;
+    shared) echo shared ; return ;;
+  esac
+  # HOST_LOCK_MODE is a job-level `env:`, and GitHub does NOT forward a job's env
+  # to ACTIONS_RUNNER_HOOK_JOB_STARTED — so an emulator job's
+  # `HOST_LOCK_MODE: exclusive` is invisible here and it would wrongly take a
+  # SHARED slot, letting sibling agents keep running during its emulator/adb
+  # session. GITHUB_JOB *is* forwarded to the hook, so fall back to the known
+  # heavy job ids. This list — keyed on GITHUB_JOB, NOT the job's env — is the
+  # actual mechanism; those jobs also set `HOST_LOCK_MODE: exclusive` as intent,
+  # but it's inert here (see above). Keep in lockstep with the job IDs that
+  # SHOULD take the exclusive lock: maestro-e2e `maestro`,
+  # build-android-{debug,release} `emulator-smoke-test`, and ci-web-e2e
+  # `web-e2e` (the heavy Playwright Tier-3 suite — on a shared VM the 3
+  # co-located agents starve its heaviest spec past even a 180s test timeout,
+  # though the full suite passes in ~6 min alone).
+  case "$GITHUB_JOB" in
+    maestro|emulator-smoke-test|web-e2e) echo exclusive ; return ;;
+  esac
+  echo shared
+}
+
+hl_reader_try() {
+  ( flock 9
+    w="$(cat "$HL_WRITER" 2>/dev/null)"
+    ww="$(hl_int "$HL_WAITING")"
+    if [ -z "$w" ] && [ "$ww" -eq 0 ]; then
+      echo $(( $(hl_int "$HL_READERS") + 1 )) > "$HL_READERS"
+      exit 0
+    fi
+    exit 1
+  ) 9>"$HL_CTL"
+}
+
+hl_reader_force() { ( flock 9; echo $(( $(hl_int "$HL_READERS") + 1 )) > "$HL_READERS" ) 9>"$HL_CTL"; }
+
+hl_acquire_shared() {
+  local waited=0
+  while ! hl_reader_try; do
+    sleep "$HL_POLL"; waited=$(( waited + HL_POLL ))
+    if [ "$waited" -ge "$HL_MAX_WAIT" ]; then
+      hl_log "shared wait exceeded $HL_MAX_WAIT s; proceeding (possible leaked exclusive lock)"
+      hl_reader_force; return 0
+    fi
+  done
+}
+
+hl_release_shared() {
+  ( flock 9
+    r="$(hl_int "$HL_READERS")"
+    if [ "$r" -gt 0 ]; then echo $(( r - 1 )) > "$HL_READERS"; else echo 0 > "$HL_READERS"; fi
+  ) 9>"$HL_CTL"
+}
+
+# Adjust the writer-waiting counter (writer-preference gate for readers).
+hl_waiting_add() {
+  ( flock 9
+    ww="$(hl_int "$HL_WAITING")"; n=$(( ww + $1 ))
+    if [ "$n" -lt 0 ]; then n=0; fi
+    echo "$n" > "$HL_WAITING"
+  ) 9>"$HL_CTL"
+}
+
+hl_writer_try() {
+  ( flock 9
+    w="$(cat "$HL_WRITER" 2>/dev/null)"
+    r="$(hl_int "$HL_READERS")"
+    if [ -z "$w" ] && [ "$r" -le 0 ]; then
+      printf '%s\n' "$1" > "$HL_WRITER"
+      exit 0
+    fi
+    exit 1
+  ) 9>"$HL_CTL"
+}
+
+hl_writer_force() { ( flock 9; printf '%s\n' "$1" > "$HL_WRITER" ) 9>"$HL_CTL"; }
+
+hl_acquire_exclusive() {
+  local id="$1" waited=0
+  hl_waiting_add 1
+  while ! hl_writer_try "$id"; do
+    sleep "$HL_POLL"; waited=$(( waited + HL_POLL ))
+    if [ "$waited" -ge "$HL_MAX_WAIT" ]; then
+      hl_log "exclusive wait exceeded $HL_MAX_WAIT s; forcing (possible leaked reader)"
+      hl_writer_force "$id"; break
+    fi
+  done
+  hl_waiting_add -1
+}
+
+hl_release_exclusive() { ( flock 9; rm -f "$HL_WRITER" ) 9>"$HL_CTL"; }
+HOSTLOCK_LIB_EOF
+
+cat > "$HOSTLOCK_STARTED" <<'HOSTLOCK_STARTED_EOF'
+#!/usr/bin/env bash
+# ACTIONS_RUNNER_HOOK_JOB_STARTED — acquire this VM's host lock before the job.
+# shellcheck source=/dev/null
+. /opt/runner-hooks/hostlock-lib.sh
+hl_init
+HL_ID="$RUNNER_NAME/$GITHUB_RUN_ID-$GITHUB_JOB"
+case "$(hl_mode)" in
+  exclusive)
+    hl_log "EXCLUSIVE requested by $HL_ID — draining regular jobs on this VM"
+    hl_acquire_exclusive "$HL_ID"
+    hl_log "EXCLUSIVE host lock held by $HL_ID"
+    ;;
+  none)
+    hl_log "HOST_LOCK_MODE=none — no host lock for $HL_ID"
+    ;;
+  *)
+    hl_acquire_shared
+    hl_log "shared host slot acquired by $HL_ID"
+    ;;
+esac
+exit 0
+HOSTLOCK_STARTED_EOF
+
+cat > "$HOSTLOCK_COMPLETED" <<'HOSTLOCK_COMPLETED_EOF'
+#!/usr/bin/env bash
+# ACTIONS_RUNNER_HOOK_JOB_COMPLETED — release this VM's host lock after the job.
+# shellcheck source=/dev/null
+. /opt/runner-hooks/hostlock-lib.sh
+hl_init
+case "$(hl_mode)" in
+  exclusive) hl_release_exclusive; hl_log "released EXCLUSIVE host lock" ;;
+  none) : ;;
+  *) hl_release_shared; hl_log "released shared host slot" ;;
+esac
+exit 0
+HOSTLOCK_COMPLETED_EOF
+
+chmod 0755 "$HOOKS_DIR"/*.sh
+
+# Runtime state on tmpfs, writable by the runner user (the hooks run as $RUNNER_USER).
+mkdir -p /run/runner-hostlock
+chown "$RUNNER_USER:$RUNNER_USER" /run/runner-hostlock
+chmod 0775 /run/runner-hostlock
+
+# ---------------------------------------------------------------------------
+# Configure + install RUNNERS_PER_VM runner agents (one job each).
+#   - Base runner name = gce-<this VM's own instance name>. In a Managed Instance
+#     Group every VM has a unique name (base-<suffix>), so runners never collide
+#     on one registration entry. Falls back to the templated instance_name for a
+#     standalone VM. Extra agents suffix the name (…-2, …-3).
+#   - Agent 1 keeps the canonical dir/name so a single-agent VM is unchanged;
+#     agents 2..N live in sibling dirs (actions-runner-N) with their own service.
+#   - One registration token registers all agents (it stays valid ~60 min), so we
+#     mint once — conserving the GitHub API budget.
+#   - --replace so a stale registration with the same name doesn't fail config.
+#   - --ephemeral ONLY in ephemeral mode.
+# ---------------------------------------------------------------------------
+INSTANCE_NAME_SELF="$(curl -sf -H "$METADATA_HEADER" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/name" 2>/dev/null || true)"
+RUNNER_NAME="gce-$${INSTANCE_NAME_SELF:-$INSTANCE_NAME_TPL}"
+
+EPHEMERAL_FLAG=""
+if [[ "$RUNNER_MODE" == "ephemeral" ]]; then
+  EPHEMERAL_FLAG="--ephemeral"
+fi
+
+# Track the EXACT systemd unit name of each agent we install (svc.sh records it in
+# the runner dir's .service file), so the health-check and ephemeral watchdog key
+# on THIS VM's own agents — not every actions.runner.* service on the box.
+EXPECTED_UNITS=()
+
+for i in $(seq 1 "$RUNNERS_PER_VM"); do
+  if [[ "$i" -eq 1 ]]; then
+    RUNNER_DIR_I="$RUNNER_DIR"
+    RUNNER_NAME_I="$RUNNER_NAME"
+  else
+    RUNNER_DIR_I="$RUNNER_HOME/actions-runner-$i"
+    RUNNER_NAME_I="$RUNNER_NAME-$i"
+  fi
+
+  log "Preparing agent $i/$RUNNERS_PER_VM: '$RUNNER_NAME_I' at $RUNNER_DIR_I"
+  mkdir -p "$RUNNER_DIR_I"
+  tar -xzf "/tmp/$RUNNER_PKG" -C "$RUNNER_DIR_I"
+  chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR_I"
+
+  # Wire the host-lock hooks into this agent's .env so the runner service loads
+  # them. Strip any prior hook lines first so a reboot re-run doesn't duplicate.
+  touch "$RUNNER_DIR_I/.env"
+  grep -vE '^ACTIONS_RUNNER_HOOK_JOB_(STARTED|COMPLETED)=' "$RUNNER_DIR_I/.env" \
+    > "$RUNNER_DIR_I/.env.tmp" 2>/dev/null || true
+  mv "$RUNNER_DIR_I/.env.tmp" "$RUNNER_DIR_I/.env"
+  {
+    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOSTLOCK_STARTED"
+    echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$HOSTLOCK_COMPLETED"
+  } >> "$RUNNER_DIR_I/.env"
+  chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR_I/.env"
+
+  # Merge the baked-toolchain env (PLAYWRIGHT_BROWSERS_PATH, ANDROID_SDK_ROOT/
+  # ANDROID_HOME, …) into THIS agent's .env so every job on the VM discovers the
+  # pre-installed tools. Idempotent: strip any prior copy of each managed key
+  # before re-appending, so a reboot re-run never duplicates lines.
+  if [[ -s "$BAKED_ENV_FILE" ]]; then
+    while IFS='=' read -r bk bv; do
+      if [[ -n "$bk" ]]; then
+        grep -vE "^$bk=" "$RUNNER_DIR_I/.env" > "$RUNNER_DIR_I/.env.baked" 2>/dev/null || true
+        mv "$RUNNER_DIR_I/.env.baked" "$RUNNER_DIR_I/.env"
+        echo "$bk=$bv" >> "$RUNNER_DIR_I/.env"
+      fi
+    done < "$BAKED_ENV_FILE"
+    chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR_I/.env"
+  fi
+
+  log "Configuring runner '$RUNNER_NAME_I' (mode=$RUNNER_MODE)..."
+  sudo -u "$RUNNER_USER" bash -c "
+    cd '$RUNNER_DIR_I'
+    ./config.sh \
+      --url '$GITHUB_SCOPE_URL' \
+      --token '$REGISTRATION_TOKEN' \
+      --name '$RUNNER_NAME_I' \
+      --labels '$RUNNER_LABELS' \
+      --work '_work' \
+      --unattended \
+      --replace \
+      $EPHEMERAL_FLAG
+  "
+
+  # Install + start this agent as its own systemd service. svc.sh derives a
+  # per-directory unit name (actions.runner.<repo>.<runner-name>.service) with
+  # Restart=always + WantedBy=multi-user.target, so it auto-restarts and survives
+  # reboot. Each agent gets an independent service, so N run in parallel.
+  log "Installing runner '$RUNNER_NAME_I' as systemd service..."
+  ( cd "$RUNNER_DIR_I" && ./svc.sh install "$RUNNER_USER" )
+  unit="$(cat "$RUNNER_DIR_I/.service" 2>/dev/null || true)"
+  [[ -n "$unit" ]] || die "svc.sh did not record a unit name for '$RUNNER_NAME_I' (missing $RUNNER_DIR_I/.service)."
+  EXPECTED_UNITS+=("$unit")
+  ( cd "$RUNNER_DIR_I" && ./svc.sh start )
+done
+
+# Registration token + downloaded tarball no longer needed.
+REGISTRATION_TOKEN=""
+unset REGISTRATION_TOKEN
+rm -f "/tmp/$RUNNER_PKG"
+
+# Give the services a moment to come up, then require EVERY expected agent — by
+# its exact unit name — to be active, and the count to match RUNNERS_PER_VM.
+sleep 5
+ACTIVE_COUNT=0
+for unit in "$${EXPECTED_UNITS[@]}"; do
+  if systemctl is-active --quiet "$unit"; then
+    ACTIVE_COUNT=$((ACTIVE_COUNT + 1))
+  else
+    log "runner service '$unit' is NOT active."
+  fi
+done
+
+if [[ "$${#EXPECTED_UNITS[@]}" -eq "$RUNNERS_PER_VM" && "$ACTIVE_COUNT" -eq "$RUNNERS_PER_VM" ]]; then
+  log "All $RUNNERS_PER_VM runner services ACTIVE. Runners should appear Idle/online in GitHub."
+else
+  die "Expected $RUNNERS_PER_VM active runner services, got $ACTIVE_COUNT active of $${#EXPECTED_UNITS[@]} installed. Check ./svc.sh status."
+fi
+
+# ---------------------------------------------------------------------------
+# Persistent mode: we are done. The runner stays registered and available,
+# the service auto-restarts on crash and survives reboot. No self-deletion.
+# Teardown is operator-driven (terraform destroy).
+# ---------------------------------------------------------------------------
+if [[ "$RUNNER_MODE" == "persistent" ]]; then
+  log "Persistent runner is up and available. Startup complete."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Ephemeral mode: post-job self-deletion watchdog.
+# The --ephemeral runner exits after one job; once the service stops, we
+# self-delete the VM. A hard max lifetime catches hung jobs.
+# ---------------------------------------------------------------------------
+log "Ephemeral mode: starting self-deletion watchdog..."
+MAX_LIFETIME_MINUTES=60
+POLL_INTERVAL=30
+ELAPSED=0
+MAX_SECONDS=$((MAX_LIFETIME_MINUTES * 60))
+
+INSTANCE_NAME="$(curl -sf -H "$METADATA_HEADER" http://metadata.google.internal/computeMetadata/v1/instance/name)"
+ZONE="$(curl -sf -H "$METADATA_HEADER" http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')"
+PROJECT="$(curl -sf -H "$METADATA_HEADER" http://metadata.google.internal/computeMetadata/v1/project/project-id)"
+
+self_delete() {
+  log "Self-deleting instance $INSTANCE_NAME in zone $ZONE (project $PROJECT)..."
+  gcloud compute instances delete "$INSTANCE_NAME" \
+    --zone="$ZONE" \
+    --project="$PROJECT" \
+    --quiet || true
+}
+
+# Trap unexpected exits (e.g. script error) to still attempt self-deletion.
+trap self_delete EXIT
+
+# Count how many of this VM's runner services are still active. An --ephemeral
+# agent exits (service goes inactive) after its one job; we self-delete once ALL
+# agents on the VM have finished, so a multi-agent ephemeral VM drains fully.
+runners_still_active() {
+  local n=0 unit
+  for unit in "$${EXPECTED_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" 2>/dev/null && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+while [[ "$(runners_still_active)" -gt 0 ]]; do
+  sleep "$POLL_INTERVAL"
+  ELAPSED=$((ELAPSED + POLL_INTERVAL))
+  if [[ "$ELAPSED" -ge "$MAX_SECONDS" ]]; then
+    log "Max lifetime ($MAX_LIFETIME_MINUTES min) reached. Forcing shutdown of all runner services."
+    for unit in "$${EXPECTED_UNITS[@]}"; do
+      systemctl stop "$unit" 2>/dev/null || true
+    done
+    break
+  fi
+done
+
+log "All ephemeral runner services have exited. Triggering self-deletion."
+# EXIT trap fires self_delete automatically.

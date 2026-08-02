@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Runner deregistration — GCE shutdown-script (Terraform template).
+#
+# Runs when the VM is shut down, preempted, or deleted (e.g. MIG scale-down or
+# Spot preemption). Best-effort: removes THIS VM's runner registration from
+# GitHub so a retired instance does not leave an offline "zombie" runner behind.
+#
+# Only ${github_repo} is interpolated by Terraform; every other $VAR is bash and
+# is intentionally written WITHOUT braces so templatefile() leaves it untouched.
+# The PAT is read from the metadata server and never echoed.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+GITHUB_REPO="${github_repo}"
+META="http://metadata.google.internal/computeMetadata/v1"
+HDR="Metadata-Flavor: Google"
+
+PAT="$(curl -sf -H "$HDR" "$META/instance/attributes/github-runner-pat" 2>/dev/null || true)"
+NAME="$(curl -sf -H "$HDR" "$META/instance/name" 2>/dev/null || true)"
+[ -n "$PAT" ] || exit 0
+[ -n "$NAME" ] || exit 0
+RUNNER_NAME="gce-$NAME"
+
+# This VM may register MULTIPLE agents (gce-<NAME>, gce-<NAME>-2, …) so it can run
+# several jobs at once. Resolve every matching id — the base name OR a
+# "<base>-<digits>" agent — then delete each. The instance name is unique in the
+# MIG, so this never matches another VM's agents (the regex anchor stops
+# "gce-foo" from also matching "gce-foobar").
+RIDS="$(curl -sf \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer $PAT" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/repos/$GITHUB_REPO/actions/runners?per_page=100" \
+  | jq -r --arg n "$RUNNER_NAME" \
+    '.runners[] | select(.name == $n or (.name | test("^" + $n + "-[0-9]+$"))) | .id')"
+
+for RID in $RIDS; do
+  [ -n "$RID" ] && [ "$RID" != "null" ] || continue
+  curl -sf -X DELETE \
+    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer $PAT" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/$GITHUB_REPO/actions/runners/$RID" || true
+done
+exit 0

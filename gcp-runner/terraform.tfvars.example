@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------------
+# terraform.tfvars.example
+#
+# Copy this file to terraform.tfvars (or pass values via TF_VAR_* env vars).
+# NEVER commit terraform.tfvars to the repository — it contains secrets.
+# terraform.tfvars is already listed in .gitignore.
+# ---------------------------------------------------------------------------
+
+# -------------------------
+# Required — no defaults
+# -------------------------
+project_id = "your-gcp-project-id"
+
+# github_runner_pat is sensitive — prefer TF_VAR_github_runner_pat env var
+# rather than writing it here. If you must use tfvars, restrict file perms:
+#   chmod 600 terraform.tfvars
+# github_runner_pat = "github_pat_..."
+
+# -------------------------
+# Free-tier defaults (safe to leave as-is)
+# -------------------------
+region            = "us-central1"   # regional MIG, any zone within. Allowed: us-central1, us-east1, us-south1
+# (no zone: the runner MIG is regional — GCP picks the zone(s) within the region)
+machine_type      = "e2-micro"      # Always Free machine type (1 per account, ~730 h/month)
+boot_disk_size_gb = 30              # Always Free standard PD allowance (30 GB total)
+boot_disk_type    = "pd-standard"   # pd-ssd LEAVES FREE TIER — billed
+
+# Registration scope. By default the runners register at the ORG level so a
+# single fleet serves EVERY repo in Bonkey-Apps (needs an org-scoped PAT with
+# "Self-hosted runners" read+write). Set github_org = "" to fall back to the
+# legacy single-repo registration via github_repo (repo Administration PAT).
+github_org     = "Bonkey-Apps"
+github_repo    = "Bonkey-Apps/bonkey-puzzles-app"  # used only when github_org = ""
+runner_labels  = ["self-hosted", "linux", "x64", "gce-free"]
+runner_version = "2.335.1"
+
+# How many REGULAR jobs one VM runs at once = how many runner agents it registers.
+# Default 2. Emulator jobs are NOT clamped here — every VM gets the same agent
+# count; a job with env HOST_LOCK_MODE=exclusive takes a host-wide exclusive lock
+# at runtime (drains regular jobs, blocks new ones until it finishes). Size to the
+# machine: an e2-micro (1 GB RAM) can only do 1; a c3-standard-4/8 runs several
+# light TS/lint/test jobs comfortably.
+# runners_per_vm = 2
+
+runner_instance_name = "gh-runner-emulator-enabled"
+
+# -------------------------
+# SSH access (debugging)
+# enable_ssh_ingress defaults to true and allows tcp/22 from ssh_source_ranges.
+# The default source is Google's IAP range, so `gcloud compute ssh
+# --tunnel-through-iap <vm> --zone <zone>` and the Cloud Console SSH button work
+# without exposing port 22 publicly. Uncomment to disable SSH or to add your own
+# CIDR for direct SSH over the VM's external IP.
+# -------------------------
+# enable_ssh_ingress = true
+# ssh_source_ranges  = ["35.235.240.0/20"]  # add "YOUR.IP.ADDR.0/24" for direct SSH
+
+# Runner lifecycle mode:
+#   "ephemeral" (default) — one-shot: registers with --ephemeral, runs one job,
+#                           then the VM self-deletes. GCE deployments are
+#                           on-demand only — see the root README.
+#   "persistent"           — registers and STAYS available across jobs; installed
+#                           as a systemd service that auto-restarts and survives
+#                           reboot. Set here as an EXPLICIT OVERRIDE of the
+#                           default — only do this if you deliberately want a
+#                           standing, continuously-billing runner.
+runner_mode = "persistent"
+
+# -------------------------
+# Android build profile
+# Uncomment the block below to switch to an Android-capable configuration.
+# ALL of these settings LEAVE FREE TIER — billed.
+# -------------------------
+
+# enable_android_profile       = true
+# android_machine_type         = "n2-standard-8"  # Intel, 8 vCPU — supports nested virt (KVM). LEAVES FREE TIER — billed.
+# android_disk_size_gb         = 80               # LEAVES FREE TIER — billed.
+# android_disk_type            = "pd-balanced"    # n2 supports pd-standard/pd-balanced/pd-ssd.
+# enable_nested_virtualization = true             # REQUIRED for a KVM-accelerated emulator (Intel non-E2 only).
+# min_cpu_platform             = "Intel Cascade Lake"  # n2-standard-8's REQUIRED floor (Haswell is rejected); >= nested-virt floor.
+# on_host_maintenance          = "TERMINATE"      # nested virt can be incompatible with live migration.
+#
+# # QUOTA: n2-standard-8 = 8 vCPU each; CPUS_ALL_REGIONS ceiling is 24 (all fleets).
+# # runner_target_size 3 = 24 vCPU (at the cap); more requires a quota increase.
+# # (target_size is managed out-of-band via `gcloud … managed resize`; the MIG
+# #  ignores changes to it after creation.)
+# runner_target_size           = 3

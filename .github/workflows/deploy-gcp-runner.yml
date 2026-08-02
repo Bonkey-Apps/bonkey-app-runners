@@ -1,0 +1,334 @@
+# Manual deploy of the GCP self-hosted runner infrastructure (Terraform).
+#
+# Trigger is workflow_dispatch ONLY — provisioning real GCE infra must never
+# happen automatically on push/PR. The job defaults to `plan` so a careless
+# run previews rather than mutates; `apply`/`destroy`/`resize` additionally
+# require the `confirm` input to equal "DEPLOY".
+#
+# Scaling to zero: the MIG `target_size` is managed OUT-OF-BAND — the module sets
+# `ignore_changes = [target_size]` so bursts aren't reverted by apply, which ALSO
+# means a plain `apply` will NOT resize a MIG that already exists. To turn the
+# running workers down (or up) use action=resize with the `mig_size` input; it
+# runs `gcloud compute instance-groups managed resize` directly (mirroring the
+# module's `resize_command` output). `mig_size` also seeds the initial size on a
+# fresh `apply`. Default mig_size=0 = idle / no compute cost.
+#
+# The Terraform lives in gcp-runner/ (provisioned by PR #141, branch
+# claude/runner-infra-141). TF var names and the runner_profile -> machine
+# mapping mirror that branch's variables.tf exactly.
+#
+# Runner selection (the `runner` input): the from-zero BOOTSTRAP (`apply` when no
+# fleet exists yet) genuinely cannot run on the fleet it creates, so it needs
+# ubuntu-latest (GitHub-hosted) — but this org has $0 hosted minutes, so an
+# ubuntu-latest job dies in ~3s with no runner. Everything else — `resize`
+# (scale up/down), `plan`, `destroy` — acts on an ALREADY-RUNNING fleet, so it
+# can (and, with no hosted minutes, MUST) run on the live self-hosted runners.
+# Hence `runner` defaults to `self-hosted`; pick `ubuntu-latest` only for a
+# from-zero bootstrap when hosted minutes exist (otherwise bootstrap locally via
+# gcp-runner/scripts/runner-up.sh where gcloud is authed). The GCE runner
+# image already has gcloud (installed by runner-startup.sh for ephemeral
+# self-deletion), so the gcloud-based `resize` step works there.
+name: Deploy GCP Runner (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_profile:
+        description: "Pre-baked runner profile (machine type / disk). All profiles LEAVE FREE TIER — billed."
+        type: choice
+        required: true
+        default: android-emulator
+        options:
+          - android-build # e2-standard-4, 100GB — LEAVES FREE TIER (billed)
+          - android-emulator # n2-standard-8 + nested-virt (KVM), 80GB — LEAVES FREE TIER (billed)
+          - graphics # GPU runner (shape chosen by graphics_machine below) — SEPARATE env root/state (coexists w/ CI runner); LEAVES FREE TIER (billed); needs the matching GPU quota
+      graphics_machine:
+        description: "GPU shape for the 'graphics' profile ONLY (ignored by other profiles). G2 = NVIDIA L4; G4 = NVIDIA RTX PRO 6000 (Blackwell) — verify accelerator/quota/disk."
+        type: choice
+        required: false
+        default: g2-standard-8
+        options:
+          - g2-standard-4 # 4 vCPU + 1x NVIDIA L4 (24GB), pd-balanced 100GB — NVIDIA_L4_GPUS quota
+          - g2-standard-8 # 8 vCPU + 1x NVIDIA L4 (24GB), pd-balanced 100GB — NVIDIA_L4_GPUS quota
+          - g4-standard-6 # 6 vCPU + NVIDIA RTX PRO 6000 (Blackwell) — VERIFY accelerator string/count/disk + G4 quota
+          - g4-standard-12 # 12 vCPU + NVIDIA RTX PRO 6000 (Blackwell) — VERIFY accelerator string/count/disk + G4 quota
+      region:
+        # Regional MIG — GCP picks any zone within the chosen region. Restricted to
+        # the set the terraform `region` variable validates. Default us-east1
+        # (us-central1 has been capacity-contended for n2). Switching region on an
+        # existing deployment REPLACES the MIG in the new region.
+        description: "GCP region to deploy the runner MIG into (any zone within it)."
+        type: choice
+        required: true
+        default: us-east1
+        options:
+          - us-east1
+          - us-south1
+          - us-central1
+      action:
+        description: "Action to run. plan is safe (read-only); apply/destroy mutate real infra; resize scales the LIVE MIG to mig_size via gcloud (the only way to change size on an existing MIG — apply won't, target_size is ignore_changes)."
+        type: choice
+        required: true
+        default: plan
+        options:
+          - plan
+          - apply
+          - destroy
+          - resize
+      mig_size:
+        description: "MIG worker count. For action=resize: the size to scale the LIVE MIG to (0 = idle, no compute cost). For apply: the initial target_size on a fresh MIG. Ignored by plan/destroy. QUOTA: n2-standard-8 emulator VM = 8 vCPU vs CPUS_ALL_REGIONS=24 → max 3."
+        type: choice
+        required: true
+        default: "0"
+        options:
+          - "0"
+          - "1"
+          - "2"
+          - "3"
+      confirm:
+        description: 'Type DEPLOY to authorize apply/destroy/resize (ignored for plan).'
+        type: string
+        required: false
+        default: ""
+      runner:
+        description: "Where to run. self-hosted = the LIVE GCE fleet — required for resize/plan/destroy against an existing MIG (and the only option with $0 hosted minutes). ubuntu-latest = only for a from-zero apply/bootstrap when hosted minutes exist; otherwise bootstrap locally (scripts/runner-up.sh)."
+        type: choice
+        required: true
+        default: self-hosted
+        options:
+          - self-hosted
+          - ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: terraform ${{ inputs.action }} (${{ inputs.runner_profile }} @ ${{ inputs.region }})
+    # Chosen by the `runner` input (see the header note). self-hosted runs on the
+    # live GCE fleet — correct for resize/plan/destroy on an existing MIG and the
+    # only option that runs at all with $0 hosted minutes. ubuntu-latest is the
+    # chicken-and-egg escape for a from-zero bootstrap when hosted minutes exist.
+    # NOTE on resize-to-0: the gcloud resize call is async and returns before any
+    # VM is actually deleted, so this job finishes before the MIG drains the very
+    # runner it ran on — the scale-down is not self-defeating in practice.
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || fromJSON('["self-hosted","linux","x64"]') }}
+    defaults:
+      run:
+        working-directory: gcp-runner
+    env:
+      # Auth + non-profile TF vars sourced from repo secrets (see PR #141 README).
+      GOOGLE_CREDENTIALS: ${{ secrets.GCP_SA_KEY }}
+      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      TF_VAR_github_runner_pat: ${{ secrets.GH_RUNNER_PAT }}
+      # Region chosen at dispatch → the terraform `region` variable (regional MIG).
+      TF_VAR_region: ${{ inputs.region }}
+    steps:
+      - name: Confirm guard (apply/destroy/resize require confirm == DEPLOY)
+        if: ${{ inputs.action == 'apply' || inputs.action == 'destroy' || inputs.action == 'resize' }}
+        # Runs BEFORE checkout, so it must not inherit the job's
+        # working-directory: gcp-runner default — that path doesn't exist
+        # until Checkout, and bash fails to start with "No such file or
+        # directory". Pin to the workspace root, which exists at job start.
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
+            echo "::error::action='${{ inputs.action }}' requires the 'confirm' input to equal DEPLOY. Aborting."
+            exit 1
+          fi
+          echo "Confirm guard passed for action='${{ inputs.action }}'."
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Pinned to an explicit version tag per the repo GitHub Actions security
+      # policy (no @v3 / @main mutable aliases for third-party actions).
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_wrapper: false
+
+      # Map the pre-baked profile -> the REAL variables.tf vars from PR #141:
+      #   machine_type, boot_disk_size_gb, enable_android_profile,
+      #   android_machine_type, android_disk_size_gb.
+      # When enable_android_profile=true the module uses android_machine_type /
+      # android_disk_size_gb, so we set those for the billed profiles.
+      - name: Map runner_profile -> Terraform vars
+        run: |
+          # Existing profiles run against the bonkey-puzzles-app ROOT (this job's
+          # working-directory: gcp-runner) via TF_CHDIR=".". The graphics
+          # profile overrides TF_CHDIR to its OWN env root (environments/graphics,
+          # separate state prefix gcp-runner-graphics), so deploying graphics can
+          # never touch or replace the CI runner — the two MIGs coexist.
+          echo "TF_CHDIR=." >> "$GITHUB_ENV"
+          # mig_size seeds the initial target_size on a fresh `apply`. On an
+          # EXISTING MIG it's a no-op for apply (target_size is ignore_changes) —
+          # the `resize` action below applies it out-of-band via gcloud instead.
+          echo "TF_VAR_runner_target_size=${{ inputs.mig_size }}" >> "$GITHUB_ENV"
+          case "${{ inputs.runner_profile }}" in
+            android-build)
+              # LEAVES FREE TIER — billed. e2-standard-4, 100GB, no nested-virt.
+              # Gets the default 3 agents; emulator jobs (none here) would serialize
+              # at runtime via the host lock, not by a provisioning-time clamp.
+              echo "TF_VAR_enable_android_profile=true" >> "$GITHUB_ENV"
+              echo "TF_VAR_android_machine_type=e2-standard-4" >> "$GITHUB_ENV"
+              echo "TF_VAR_android_disk_size_gb=100" >> "$GITHUB_ENV"
+              # Root MIG name (default runner_instance_name) — for action=resize.
+              echo "MIG_NAME=gh-runner-emulator-enabled" >> "$GITHUB_ENV"
+              ;;
+            android-emulator)
+              # LEAVES FREE TIER — billed. n2-standard-8 (Intel, 8 vCPU) supports
+              # nested virtualization (KVM), required to hardware-accelerate the
+              # Android emulator; 80GB pd-balanced. enable_nested_virtualization
+              # MUST be true or the VM comes up without /dev/kvm and the emulator
+              # falls back to software (boot timeout). min_cpu_platform must be
+              # "Intel Cascade Lake" — n2-standard-8's REQUIRED floor (a lower
+              # value like Haswell is rejected: "required CPU platform of
+              # cascadelake"); Cascade Lake is >= the nested-virt floor, so KVM
+              # still works. TERMINATE because nested virt is incompatible with
+              # live migration.
+              # QUOTA: 8 vCPU/VM vs CPUS_ALL_REGIONS=24 (3 VMs = the cap).
+              # Gets the default 3 agents. An emulator job (env HOST_LOCK_MODE=
+              # exclusive) takes the host-wide exclusive lock at runtime — it drains
+              # the other agents and blocks new jobs on this VM until it finishes —
+              # so KVM contention is handled without reducing the agent count.
+              echo "TF_VAR_enable_android_profile=true" >> "$GITHUB_ENV"
+              echo "TF_VAR_android_machine_type=n2-standard-8" >> "$GITHUB_ENV"
+              echo "TF_VAR_android_disk_size_gb=80" >> "$GITHUB_ENV"
+              echo "TF_VAR_android_disk_type=pd-balanced" >> "$GITHUB_ENV"
+              echo "TF_VAR_enable_nested_virtualization=true" >> "$GITHUB_ENV"
+              echo "TF_VAR_min_cpu_platform=Intel Cascade Lake" >> "$GITHUB_ENV"
+              echo "TF_VAR_on_host_maintenance=TERMINATE" >> "$GITHUB_ENV"
+              echo "TF_VAR_runner_instance_name=gh-runner-emulator-enabled" >> "$GITHUB_ENV"
+              # Root MIG name — for action=resize.
+              echo "MIG_NAME=gh-runner-emulator-enabled" >> "$GITHUB_ENV"
+              ;;
+            graphics)
+              # LEAVES FREE TIER — billed. Runs terraform in the SEPARATE env
+              # root gcp-runner/environments/graphics (own state prefix
+              # gcp-runner-graphics), a REGIONAL MIG that COEXISTS with the CI
+              # runner (separate state) and never replaces it. The GPU shape is
+              # PARAMETERIZED: this step maps the graphics_machine input →
+              # TF_VAR_machine_type / gpu_type / gpu_count / boot_disk_* below
+              # (on_host_maintenance=TERMINATE is forced by the module for GPUs).
+              # ⚠️ Provisions nothing until action=apply + confirm=DEPLOY, AFTER the
+              # matching GPU quota grant (NVIDIA_L4_GPUS for G2, RTX PRO 6000 for
+              # G4). The NVIDIA driver install is APPLY-TIME-UNVERIFIED — validate
+              # nvidia-smi on the first provision.
+              # QUOTA: the GPU VM's vCPUs count SIMULTANEOUSLY with the CI runner's
+              # vs CPUS_ALL_REGIONS=24; keep target_size at 1 and do NOT autoscale.
+              # Regional MIG picks any L4/RTX-capable zone in TF_VAR_region.
+              echo "TF_CHDIR=environments/graphics" >> "$GITHUB_ENV"
+              # Graphics env MIG name (environments/graphics) — for action=resize.
+              echo "MIG_NAME=graphics-github-runner" >> "$GITHUB_ENV"
+              # The env uses a REGIONAL MIG (any zone in TF_VAR_region), so zone is
+              # unused; passed for backward-compat only.
+              echo "TF_VAR_zone=${{ inputs.region }}-a" >> "$GITHUB_ENV"
+              # Regional-MIG placement: ANY target shape so a Spot GPU stockout in
+              # one zone ("does not have enough resources") falls through to another
+              # capable zone instead of retry-looping on the dead one. The zone list
+              # (set per GPU family below) restricts candidates to accelerator-capable
+              # zones so the MIG never attempts a no-GPU zone (LOCATION_POLICY).
+              echo "TF_VAR_distribution_policy_target_shape=ANY" >> "$GITHUB_ENV"
+              # Map the chosen GPU shape → machine/accelerator/disk TF_VARs.
+              case "${{ inputs.graphics_machine }}" in
+                g2-standard-4 | g2-standard-8)
+                  # G2 + 1x NVIDIA L4 (24GB VRAM). Needs NVIDIA_L4_GPUS quota.
+                  echo "TF_VAR_machine_type=${{ inputs.graphics_machine }}" >> "$GITHUB_ENV"
+                  echo "TF_VAR_gpu_type=nvidia-l4" >> "$GITHUB_ENV"
+                  echo "TF_VAR_gpu_count=1" >> "$GITHUB_ENV"
+                  echo "TF_VAR_boot_disk_size_gb=100" >> "$GITHUB_ENV"
+                  echo "TF_VAR_boot_disk_type=pd-balanced" >> "$GITHUB_ENV"
+                  # L4-capable zones per region (L4 is NOT in every zone).
+                  case "${{ inputs.region }}" in
+                    us-east1)    echo 'TF_VAR_distribution_policy_zones=["us-east1-c","us-east1-d"]' >> "$GITHUB_ENV" ;;
+                    us-central1) echo 'TF_VAR_distribution_policy_zones=["us-central1-a","us-central1-b","us-central1-c"]' >> "$GITHUB_ENV" ;;
+                    *)           echo 'TF_VAR_distribution_policy_zones=[]' >> "$GITHUB_ENV" ;;
+                  esac
+                  ;;
+                g4-standard-6 | g4-standard-12)
+                  # G4 = NVIDIA RTX PRO 6000 (Blackwell), FRACTIONAL vGPU shapes:
+                  # g4-standard-6 = 1/8 GPU, g4-standard-12 = 1/4 GPU. The GPU is
+                  # BUILT INTO the machine type, so gpu_count=0 → NO guest_accelerator
+                  # block (a fractional count can't be declared; GCP rejects it).
+                  # enable_gpu stays true (drives TERMINATE + NVIDIA driver install).
+                  # G4 is available in us-central1/us-east1/us-east4/europe-west4.
+                  # ⚠️ Disk type still UNVERIFIED — if apply/plan reports G4 requires
+                  # hyperdisk-balanced, change TF_VAR_boot_disk_type below. Use
+                  # action=plan first. Needs the RTX PRO 6000 GPU quota (not L4).
+                  echo "TF_VAR_machine_type=${{ inputs.graphics_machine }}" >> "$GITHUB_ENV"
+                  echo "TF_VAR_gpu_type=nvidia-rtx-pro-6000" >> "$GITHUB_ENV"
+                  echo "TF_VAR_gpu_count=0" >> "$GITHUB_ENV"
+                  echo "TF_VAR_boot_disk_size_gb=200" >> "$GITHUB_ENV"
+                  echo "TF_VAR_boot_disk_type=pd-balanced" >> "$GITHUB_ENV"
+                  # G4/RTX PRO 6000 per-zone availability is UNVERIFIED — leave the
+                  # candidate zones empty (all region zones) and let ANY find a
+                  # capable one. Pin these once the exact G4 zones are confirmed.
+                  echo 'TF_VAR_distribution_policy_zones=[]' >> "$GITHUB_ENV"
+                  ;;
+                *)
+                  echo "::error::Unknown graphics_machine '${{ inputs.graphics_machine }}'."
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error::Unknown runner_profile '${{ inputs.runner_profile }}'."
+              exit 1
+              ;;
+          esac
+          echo "Mapped profile '${{ inputs.runner_profile }}' to Terraform vars."
+
+      # TF_CHDIR selects the Terraform root: "." = the bonkey-puzzles-app root
+      # (android-build/android-emulator), "environments/graphics" = the separate
+      # GPU env root. -chdir is resolved relative to working-directory (gcp-runner).
+      - name: Terraform init
+        run: terraform -chdir="$TF_CHDIR" init
+
+      - name: Terraform plan
+        if: ${{ inputs.action == 'plan' }}
+        run: terraform -chdir="$TF_CHDIR" plan -input=false
+
+      - name: Terraform apply
+        if: ${{ inputs.action == 'apply' }}
+        run: terraform -chdir="$TF_CHDIR" apply -input=false -auto-approve
+
+      - name: Terraform destroy
+        if: ${{ inputs.action == 'destroy' }}
+        run: terraform -chdir="$TF_CHDIR" destroy -input=false -auto-approve
+
+      # Scale the LIVE MIG to mig_size (0 = idle, no compute cost). This is the
+      # ONLY way to change an existing MIG's size through this workflow: the
+      # module pins `ignore_changes = [target_size]`, so `apply` never resizes a
+      # MIG that already exists — it's managed out-of-band, exactly as the
+      # module's `resize_command` output documents. Both the root CI MIG and the
+      # graphics MIG are REGIONAL, so resize targets --region (not --zone).
+      - name: Resize MIG (gcloud, out-of-band)
+        if: ${{ inputs.action == 'resize' }}
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          set -euo pipefail
+          # Preflight: fail fast with a clear message rather than a confusing
+          # downstream error.
+          command -v gcloud >/dev/null 2>&1 || {
+            echo "::error::gcloud not found on the runner image; cannot resize."
+            exit 1
+          }
+          : "${MIG_NAME:?MIG_NAME not set by the profile-mapping step}"
+          : "${GCP_SA_KEY:?GCP_SA_KEY secret is missing or empty}"
+          KEY_FILE="$(mktemp)"
+          # Best-effort shred the key file on exit (even on failure); fall back to
+          # rm where shred is unavailable.
+          trap 'shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"' EXIT
+          printf '%s' "$GCP_SA_KEY" > "$KEY_FILE"
+          gcloud auth activate-service-account --key-file="$KEY_FILE"
+          echo "Resizing MIG '$MIG_NAME' in ${{ inputs.region }} to ${{ inputs.mig_size }} worker(s)…"
+          gcloud compute instance-groups managed resize "$MIG_NAME" \
+            --region="${{ inputs.region }}" \
+            --size="${{ inputs.mig_size }}" \
+            --project="$TF_VAR_project_id"
+          echo "Resize requested. Current managed instances:"
+          gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+            --region="${{ inputs.region }}" \
+            --project="$TF_VAR_project_id" || true
