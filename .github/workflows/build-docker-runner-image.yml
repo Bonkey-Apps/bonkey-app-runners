@@ -51,6 +51,13 @@ jobs:
           name="ghcr.io/bonkey-apps/bonkey-apps-runner"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "sha=${SHA:0:12}" >> "$GITHUB_OUTPUT"
+          # Semver on the image CONTENTS (Ubuntu + JDK + Android SDK/NDK +
+          # Gradle generation), bumped by hand in docker-runner/VERSION — not
+          # derived from git tags/commit count, since :latest and :$SHA
+          # already give per-build identity; this gives per-baseline identity
+          # so "which toolchain generation is this runner on" is answerable
+          # from the tag alone (bonkey-app-runners#4).
+          echo "version=v$(cat docker-runner/VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         env:
@@ -62,6 +69,7 @@ jobs:
         env:
           NAME: ${{ steps.img.outputs.name }}
           SHA: ${{ steps.img.outputs.sha }}
+          VERSION: ${{ steps.img.outputs.version }}
           # Defaults to true on a push (inputs is empty); the dispatch input can override.
           INSTALL_ANDROID: ${{ github.event.inputs.install_android || 'true' }}
         run: |
@@ -71,26 +79,31 @@ jobs:
             -f docker-runner/Dockerfile \
             -t "$NAME:latest" \
             -t "$NAME:$SHA" \
+            -t "$NAME:$VERSION" \
             docker-runner
 
       - name: Push image
         env:
           NAME: ${{ steps.img.outputs.name }}
           SHA: ${{ steps.img.outputs.sha }}
+          VERSION: ${{ steps.img.outputs.version }}
         run: |
           docker push "$NAME:latest"
           docker push "$NAME:$SHA"
+          docker push "$NAME:$VERSION"
 
       - name: Summary
         env:
           NAME: ${{ steps.img.outputs.name }}
           SHA: ${{ steps.img.outputs.sha }}
+          VERSION: ${{ steps.img.outputs.version }}
         run: |
           {
             echo "### Runner image published"
             echo ""
             echo "- \`$NAME:latest\`"
             echo "- \`$NAME:$SHA\`"
+            echo "- \`$NAME:$VERSION\`"
             echo ""
-            echo "Pull on a Mac: \`docker pull $NAME:latest\`"
+            echo "Pull on a Mac: \`docker pull $NAME:$VERSION\` (pin) or \`docker pull $NAME:latest\` (float)"
           } >> "$GITHUB_STEP_SUMMARY"
