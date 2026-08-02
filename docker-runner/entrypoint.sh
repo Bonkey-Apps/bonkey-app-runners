@@ -18,6 +18,9 @@
 #   RUNNER_GROUP    runner group name  (default: Default)
 #   RUNNER_EPHEMERAL true|false        (default: true — one job then exit)
 #   RUNNER_REPLACE   true|false        (default: true — replace a same-named runner)
+#   BONKEY_NATIVE_BUILD_JOBS  ninja/CMake concurrency cap for Android native
+#                             builds (default: 2, tuned to this container's
+#                             CPU/memory ceiling — see the derivation below)
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -60,6 +63,25 @@ if [ -z "${JAVA_HOME:-}" ] && command -v java >/dev/null 2>&1; then
   export JAVA_HOME
   log "JAVA_HOME=${JAVA_HOME} (derived from the baked JDK)"
 fi
+
+# --- Native (ninja/CMake) build concurrency ---------------------------------
+# This is a property of the RUNNER (its CPU/memory ceiling and whatever else
+# shares the host), not of the app being built — every consumer doing an
+# Android native build needs the same tuning, and each was discovering it the
+# same expensive way (a version bump + full release run per data point).
+# Bonkey-cards-app#1032's evidence: uncapped concurrency died at 15m12s (8
+# orphaned clang++ at kill), --max-workers=4 died at 21m17s (5 orphaned).
+# 2 is the current best-evidence value on THIS container's allocation
+# (~9.7GB / 8 cores) — not yet confirmed sufficient, revisit if the host's
+# memory/CPU allocation changes or evidence says otherwise.
+# Overridable (`docker run -e BONKEY_NATIVE_BUILD_JOBS=N` or a bigger box);
+# consumers should read it with a fallback (`${BONKEY_NATIVE_BUILD_JOBS:-4}`)
+# so GitHub-hosted runners and any image predating this keep working.
+BONKEY_NATIVE_BUILD_JOBS="${BONKEY_NATIVE_BUILD_JOBS:-2}"
+export BONKEY_NATIVE_BUILD_JOBS
+CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-${BONKEY_NATIVE_BUILD_JOBS}}"
+export CMAKE_BUILD_PARALLEL_LEVEL
+log "BONKEY_NATIVE_BUILD_JOBS=${BONKEY_NATIVE_BUILD_JOBS} (CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL})"
 
 # --- Resolve a registration token ------------------------------------------
 if [ -z "${RUNNER_TOKEN:-}" ]; then
