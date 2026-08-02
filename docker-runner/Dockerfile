@@ -16,7 +16,8 @@
 #   Android BUILD (INSTALL_ANDROID=true, default):
 #     • OpenJDK 17 (JAVA_HOME exported at runtime by entrypoint.sh)
 #     • Android command-line tools + platform-tools + platforms;android-34
-#       + build-tools;34.0.0 (licenses accepted)          → /opt/android-sdk
+#       + build-tools;34.0.0 + ndk;NDK_VERSION (licenses accepted)
+#                                                          → /opt/android-sdk
 #     • bundletool 1.18.1                                  → /opt/bundletool
 #     • Gradle wrapper distribution cache, pre-populated for GRADLE_VERSION
 #       (GRADLE_USER_HOME)                                 → /opt/gradle-cache
@@ -45,6 +46,11 @@ ARG JAVA_VERSION=17
 ARG ANDROID_CMDLINE_TOOLS=commandlinetools-linux-14742923_latest.zip
 ARG ANDROID_PLATFORM=android-34
 ARG ANDROID_BUILD_TOOLS=34.0.0
+# Must track whatever `expo prebuild` / AGP resolves via app.json's ndkVersion
+# (currently 27.1.12297006, confirmed from a live failure log —
+# bonkey-cards-app#1032: the image never baked this at all, so AGP tried to
+# auto-download it at job time and left a truncated install behind).
+ARG NDK_VERSION=27.1.12297006
 ARG BUNDLETOOL_VERSION=1.18.1
 # Must track whatever `expo prebuild` pins in the generated
 # gradle/wrapper/gradle-wrapper.properties (currently 9.3.1, confirmed from a
@@ -140,7 +146,16 @@ RUN set -eux; \
       # Accept licenses + install platform-tools, the target platform, build-tools.
       yes 2>/dev/null | "${CMDLINE_DIR}/bin/sdkmanager" --sdk_root="${ANDROID_SDK_ROOT}" --licenses >/dev/null 2>&1 || true; \
       yes 2>/dev/null | "${CMDLINE_DIR}/bin/sdkmanager" --sdk_root="${ANDROID_SDK_ROOT}" \
-        "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null; \
+        "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" \
+        "ndk;${NDK_VERSION}" >/dev/null; \
+      # Fail the BAKE if the NDK installed but didn't actually complete.
+      # sdkmanager can leave a directory behind (with only a `.installer/`
+      # staging subfolder) on an interrupted install — a directory-exists
+      # check would treat that as present, exactly the "truthy but broken"
+      # trap that bit the JDK guard earlier in this same issue. AGP reads
+      # source.properties to identify a valid NDK, so that's what we check.
+      test -f "${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}/source.properties" \
+        || { echo "ndk;${NDK_VERSION} installed but source.properties is missing — sdkmanager install did not complete." >&2; exit 1; }; \
       # bundletool jar (single pinned version, matches setup-bundletool).
       mkdir -p /opt/bundletool; \
       curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
