@@ -58,8 +58,12 @@ apt-get install -y -q curl jq git unzip tar libicu72 libssl3 ca-certificates sud
 log "Installing Node.js 24 + pnpm..."
 curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
 apt-get install -y -q nodejs
-npm install -g pnpm@latest
-npx -y playwright@latest install-deps chromium || true
+# Pinned, not @latest — keep in lockstep with IMAGE-MANIFEST.md and each
+# consuming repo's packageManager / @playwright/test version. @latest would
+# make runner bring-up non-reproducible and risks an unpinned release
+# unexpectedly breaking jobs.
+npm install -g pnpm@10.33.0
+npx -y playwright@1.61.1 install-deps chromium || true
 
 # gcloud CLI (for self-deletion).
 if ! command -v gcloud &>/dev/null; then

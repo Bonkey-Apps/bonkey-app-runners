@@ -56,11 +56,14 @@ runner_instance_name = "gh-runner-emulator-enabled"
 # ssh_source_ranges  = ["35.235.240.0/20"]  # add "YOUR.IP.ADDR.0/24" for direct SSH
 
 # Runner lifecycle mode:
-#   "persistent" (default) — registers and STAYS available across jobs; installed
-#                            as a systemd service that auto-restarts and survives
-#                            reboot. "terraform apply" yields an available runner.
-#   "ephemeral"            — one-shot: registers with --ephemeral, runs one job,
-#                            then the VM self-deletes. Use for on-demand JIT runs.
+#   "ephemeral" (default) — one-shot: registers with --ephemeral, runs one job,
+#                           then the VM self-deletes. GCE deployments are
+#                           on-demand only — see the root README.
+#   "persistent"           — registers and STAYS available across jobs; installed
+#                           as a systemd service that auto-restarts and survives
+#                           reboot. Set here as an EXPLICIT OVERRIDE of the
+#                           default — only do this if you deliberately want a
+#                           standing, continuously-billing runner.
 runner_mode = "persistent"
 
 # -------------------------

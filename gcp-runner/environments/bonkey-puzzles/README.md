@@ -42,8 +42,8 @@ bonkey-puzzles; **bonkey-puzzles' own runner only runs the light Pages deploy**
 | `boot_disk_size_gb` | `30` | Always Free standard-PD allowance |
 | `boot_disk_type` | `pd-standard` | `pd-ssd` leaves free tier |
 | `region` / `zone` | `us-central1` / `us-central1-a` | Always-Free region |
-| `runner_mode` | `persistent` | Standing runner, survives reboot |
-| `runner_target_size` | `1` | One always-on free runner (~730 h/mo = $0) |
+| `runner_mode` | `ephemeral` | On-demand only — no standing fleet |
+| `runner_target_size` | `0` | Idle by default; provision on demand (see `scripts/runner-up.sh` or a deliberate resize) rather than an always-on runner |
 | `runner_instance_name` | `gh-runner-puzzles` | Distinct from bonkey-puzzles-app `gh-runner` |
 | `runner_labels` | `self-hosted, linux, x64, gce-free, bonkey-puzzles` | Routes the deploy job here |
 | `network_tags` | `gh-runner-puzzles` | Own deny-ingress firewall target |

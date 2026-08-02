@@ -46,7 +46,7 @@ command -v jq >/dev/null || die "jq missing from image"
 if [ -z "${RUNNER_TOKEN:-}" ]; then
   [ -n "${GH_PAT:-}" ] || die "provide GH_PAT (org runner admin) or RUNNER_TOKEN"
   log "Minting an org registration token for ${GITHUB_ORG} from GH_PAT..."
-  RUNNER_TOKEN="$(curl -k -sf -X POST \
+  RUNNER_TOKEN="$(curl -sf -X POST \
     -H "Accept: application/vnd.github+json" \
     -H "Authorization: Bearer ${GH_PAT}" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -77,7 +77,7 @@ deregister() {
   log "Removing runner registration..."
   local remove_token="${RUNNER_TOKEN}"
   if [ -n "${GH_PAT:-}" ]; then
-    remove_token="$(curl -k -sf -X POST \
+    remove_token="$(curl -sf -X POST \
       -H "Accept: application/vnd.github+json" \
       -H "Authorization: Bearer ${GH_PAT}" \
       -H "X-GitHub-Api-Version: 2022-11-28" \

@@ -35,7 +35,7 @@ a belt-and-suspenders reconcile.
   workflow was removed — see the note at the top.)
 
 ## Requirements
-- `GH_RUNNER_PAT` secret (repo **Administration: read+write**) — mints JIT configs.
+- `GH_PAT` env var (repo **Administration: read+write**) — mints JIT configs.
 - The runner SA (`github@`) needs `compute.instanceAdmin`/`compute.admin` to
   create + self-delete instances (already granted).
 - `--android` requires an Intel non-E2 machine (KVM/nested-virt); it adds

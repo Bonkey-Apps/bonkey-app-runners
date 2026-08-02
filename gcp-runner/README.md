@@ -198,7 +198,10 @@ jobs:
 A GitHub Actions runner **agent** runs exactly one job at a time, so the startup
 script registers **`runners_per_vm` agents per VM** — each in its own directory
 and systemd service (`gce-<instance>`, `gce-<instance>-2`, …) — giving the VM
-that many parallel job slots. **Default: 3.**
+that many parallel job slots. **Default: 2** for this root config
+(`gcp-runner/variables.tf`); the reusable `modules/runner-mig/` module
+defaults to **1** (multi-agent contention caused e2e false-reds — #721 — so
+both current module consumers pin 1).
 
 **Every VM gets the same agent count — including emulator-capable ones.** The
 emulator constraint is enforced at **runtime**, not by reducing agents, via a
