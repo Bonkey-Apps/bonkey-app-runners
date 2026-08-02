@@ -177,6 +177,7 @@ All via `.env` (see `.env.example` for the full annotated list):
 | `PLAYWRIGHT_VERSION` | `1.61.1` | Baked Playwright (== each repo's `@playwright/test`) |
 | `INSTALL_ANDROID` | `true` | Bake Java 17 + Android SDK + bundletool (amd64 only; `false` for lean/arm64) |
 | `RUNNER_PLATFORM` | `linux/amd64` | `linux/amd64` (→ `x64`) or `linux/arm64` |
+| `BONKEY_NATIVE_BUILD_JOBS` | `2` | ninja/CMake concurrency cap for Android native builds, derived at runtime from this container's CPU/memory ceiling (see the export in `entrypoint.sh` for the evidence behind the default). Consuming workflows should read it (`--max-workers=${BONKEY_NATIVE_BUILD_JOBS:-4}`) instead of hardcoding a value. |
 
 ### amd64 vs arm64
 
