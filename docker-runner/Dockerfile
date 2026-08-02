@@ -14,7 +14,7 @@
 #     • Playwright 1.61.1 Chromium browser + its OS libs  → /opt/pw-browsers
 #     • GitHub CLI (gh), git, ripgrep, fd-find, jq, python3
 #   Android BUILD (INSTALL_ANDROID=true, default):
-#     • Temurin/OpenJDK 17
+#     • OpenJDK 17, with JAVA_HOME exported     → /usr/lib/jvm/java-17-openjdk-amd64
 #     • Android command-line tools + platform-tools + platforms;android-34
 #       + build-tools;34.0.0 (licenses accepted)          → /opt/android-sdk
 #     • bundletool 1.18.1                                  → /opt/bundletool
@@ -53,7 +53,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
     ANDROID_SDK_ROOT=/opt/android-sdk \
     ANDROID_HOME=/opt/android-sdk \
-    BUNDLETOOL_JAR=/opt/bundletool/bundletool-all.jar
+    BUNDLETOOL_JAR=/opt/bundletool/bundletool-all.jar \
+    JAVA_HOME=/usr/lib/jvm/java-${JAVA_VERSION}-openjdk-amd64
 
 # --- CI base: OS deps + search tools (all repos) ---------------------------
 RUN set -eux; \
@@ -139,12 +140,19 @@ RUN set -eux; \
         "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
         -o "${BUNDLETOOL_JAR}"; \
       chown -R runner:runner "${ANDROID_SDK_ROOT}" /opt/bundletool; \
+      # Fail the BAKE if JAVA_HOME does not point at the JDK we just installed.
+      # Consumers skip `actions/setup-java` on the strength of this env var, so
+      # a wrong path here would not surface until a release build failed —
+      # exactly the silent-at-build, loud-at-release shape worth avoiding.
+      test -x "${JAVA_HOME}/bin/java" \
+        || { echo "JAVA_HOME=${JAVA_HOME} has no bin/java after installing openjdk-${JAVA_VERSION}-jdk-headless. Debian's JDK path convention changed — update the JAVA_HOME ENV." >&2; exit 1; }; \
+      "${JAVA_HOME}/bin/java" -version; \
     else \
       echo "INSTALL_ANDROID=false — skipping Java/Android SDK/bundletool bake."; \
     fi
 
 # Android SDK on PATH (harmless when the layer was skipped).
-ENV PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}"
+ENV PATH="${JAVA_HOME}/bin:${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${PATH}"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
