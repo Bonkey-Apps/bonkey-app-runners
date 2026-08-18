@@ -11,7 +11,9 @@
 # Baked (see that manifest):
 #   CI (all repos, unconditional):
 #     • Node 24, pnpm 10.33.0 (== packageManager)
-#     • Playwright 1.61.1 Chromium browser + its OS libs  → /opt/pw-browsers
+#     • Playwright Chromium browsers + their OS libs      → /opt/pw-browsers
+#       TWO revisions side by side: 1.62.1 (cards) and 1.61.1 (puzzles /
+#       math). See the bake layer below for why both.
 #     • GitHub CLI (gh), git, ripgrep, fd-find, jq, python3
 #   Android BUILD (INSTALL_ANDROID=true, default):
 #     • OpenJDK 17 (JAVA_HOME exported at runtime by entrypoint.sh)
@@ -39,7 +41,12 @@ FROM ubuntu:24.04
 # --- Version pins (keep in lockstep with IMAGE-MANIFEST.md + package.json) ---
 ARG RUNNER_VERSION=2.335.1
 ARG PNPM_VERSION=10.33.0
-ARG PLAYWRIGHT_VERSION=1.61.1
+# Playwright is baked TWICE — the app repos are not all on the same version
+# (BC-132). Both installs land in the same PLAYWRIGHT_BROWSERS_PATH under their
+# own chromium-<revision>/ directory, so they coexist rather than overwrite.
+# Drop PLAYWRIGHT_VERSION_PREV once every repo is on the primary pin.
+ARG PLAYWRIGHT_VERSION=1.62.1
+ARG PLAYWRIGHT_VERSION_PREV=1.61.1
 # Android build toolchain (heavy, amd64-only) — set false for a lean JS/web image.
 ARG INSTALL_ANDROID=true
 ARG JAVA_VERSION=17
@@ -119,12 +126,31 @@ RUN set -eux; \
     rm -f /tmp/runner.tar.gz; \
     chown -R runner:runner /home/runner
 
-# --- Playwright 1.61.1 Chromium + OS deps (baked to /opt/pw-browsers) -------
+# --- Playwright Chromium + OS deps (baked to /opt/pw-browsers) -------------
 # --with-deps installs the apt libs Chromium needs (Tier 3 web-local e2e +
 # screenshots). Owned by runner so jobs read it as a warm no-op.
+#
+# Why TWO versions (BC-132): Playwright resolves its browser by REVISION —
+# `playwright install` writes ${PLAYWRIGHT_BROWSERS_PATH}/chromium-<rev>/, and
+# there is no version-agnostic `chromium` entry to fall back on (the app repos'
+# playwright.config.ts probes for one and finds nothing, so resolution goes
+# through the revision). `playwright install` is BANNED in CI by repo rule, so
+# a runner baking exactly one revision hard-fails e2e for every repo pinned to
+# a different @playwright/test. bonkey-cards-app is moving to 1.62.1 while
+# bonkey-puzzles-app and bonkey-math-app stay on 1.61.1, and this is an
+# ORG-level runner serving all three — so "just bump it" is not available.
+# Delete the PREV install when the last repo moves.
 RUN set -eux; \
     mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"; \
     npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium; \
+    npx --yes "playwright@${PLAYWRIGHT_VERSION_PREV}" install --with-deps chromium; \
+    # Fail the BAKE if the second install did not add its own revision, rather
+    # than discovering it as a red e2e job on whichever repo runs first. Each
+    # version writes exactly one chromium-<rev>; two versions must leave two.
+    revs="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -mindepth 1 -maxdepth 1 -type d \
+              -name 'chromium-*' | wc -l)"; \
+    test "$revs" -ge 2 \
+      || { echo "expected 2 baked chromium revisions (${PLAYWRIGHT_VERSION} + ${PLAYWRIGHT_VERSION_PREV}), found ${revs}" >&2; exit 1; }; \
     chown -R runner:runner "${PLAYWRIGHT_BROWSERS_PATH}"; \
     rm -rf /var/lib/apt/lists/*
 

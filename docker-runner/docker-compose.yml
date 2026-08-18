@@ -16,7 +16,10 @@ services:
       args:
         RUNNER_VERSION: ${RUNNER_VERSION:-2.335.1}
         PNPM_VERSION: ${PNPM_VERSION:-10.33.0}
-        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.61.1}
+        # Two Chromium revisions are baked side by side — the app repos are
+        # not all on the same @playwright/test (BC-132). See the Dockerfile.
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.62.1}
+        PLAYWRIGHT_VERSION_PREV: ${PLAYWRIGHT_VERSION_PREV:-1.61.1}
         # Bake the Java/Android-SDK/bundletool build toolchain (amd64 only).
         # Set false in .env for a lean JS/web-only image or an arm64 build.
         INSTALL_ANDROID: ${INSTALL_ANDROID:-true}
