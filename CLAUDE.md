@@ -145,9 +145,43 @@ which one applies depends on which Terraform root you're editing.
 GCE runner VMs at boot (Node, pnpm, Playwright, GitHub CLI, Android
 SDK/emulator system-image) so per-job `setup-*` steps become warm no-ops.
 Version pins here must stay in lockstep with each consuming app repo's
-`package.json` / `@playwright/test` version — a mismatch means the bake
-"misses" and the per-job installer falls back to (slower) on-demand install,
-not a hard failure.
+`package.json`. For most entries a mismatch means the bake "misses" and the
+per-job installer falls back to a (slower) on-demand install, not a hard
+failure.
+
+**Playwright is the exception, and it is a hard failure.** Playwright resolves
+its browser by *revision* — `playwright install` writes
+`$PLAYWRIGHT_BROWSERS_PATH/chromium-<rev>/` and leaves nothing
+version-agnostic behind (the app repos' `playwright.config.ts` probes for
+`/opt/pw-browsers/chromium`, does not find it, and falls through to the
+revision lookup) — and the per-job `playwright install` is **banned** by the
+app repos' own rules. So a mismatched pin has no fallback at all.
+
+Because this is an **org-level** runner (one image serves Puzzles, Cards and
+Math) and those repos drift apart during an upgrade, the runner bakes **one
+Chromium per pin in use, not one overall**: `PLAYWRIGHT_VERSION` +
+`PLAYWRIGHT_VERSION_PREV` in `docker-runner/Dockerfile`, and a
+`PLAYWRIGHT_VERSIONS` array in **both** `runner-startup.sh.tftpl` copies. Add
+an entry when a repo adopts a new pin; remove one only once no repo pins it.
+
+### Runner toolchain changes are two-sided and ordered
+
+Any toolchain the runner bakes and an app pins is a two-sided change with a
+mandatory order: **publish and roll the runner image first, bump the app
+second.** Reversed, the failure signature is *locally green / CI-red* — every
+local gate passes, only Actions fails, and it fails for every open PR until the
+image catches up.
+
+Rolling the local Docker runner: `docker compose pull`, then `docker compose up
+-d`. Verify it actually moved — `up -d` has been observed to report `Recreate`
+and leave the container on the **old** image id. Compare `docker inspect -f
+'{{.Image}}' docker-runner-runner-1` against `docker images`, and use `up -d
+--force-recreate` if they disagree.
+
+Which runner a job lands on is decided per repo by the `CI_RUNNER` Actions
+variable. `bonkey-cards-app` sets `["self-hosted"]` — the bare label — so its
+jobs take *any* org runner, including a developer's local Docker one. This repo
+sets nothing and falls back to `ubuntu-latest`.
 
 ### Host readers/writer lock (GCE, KVM/emulator jobs)
 
