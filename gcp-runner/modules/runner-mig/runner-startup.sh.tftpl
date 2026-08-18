@@ -323,30 +323,41 @@ chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR"
 # installed above; here we pre-fetch the *browser binary* into a shared
 # PLAYWRIGHT_BROWSERS_PATH owned by the runner user, so the per-job
 # `playwright install chromium` (ci-web-e2e + ci-screenshots — every UI PR, in
-# BOTH app repos) becomes a fast no-op. Pinned to the repos' @playwright/test
-# version (all three currently pin 1.61.1); the browser revision Playwright
-# fetches is keyed to this version, so a match means zero per-job download. A
-# repo that bumps Playwright just has that one job fetch the new revision into
-# the runner-owned dir — additive and safe. Idempotent via a per-version marker.
-# Runs as the runner user so the cache is writable by jobs. errexit off so a
-# failed fetch can NEVER abort boot.
+# BOTH app repos) becomes a fast no-op. The browser revision Playwright fetches
+# is keyed to the @playwright/test version, so a match means zero per-job
+# download. Idempotent via a per-version marker. Runs as the runner user so the
+# cache is writable by jobs. errexit off so a failed fetch can NEVER abort boot.
+#
+# EVERY version the app repos pin is baked (BC-132). Playwright resolves its
+# browser by REVISION — `playwright install` writes chromium-<rev>/ and there is
+# no version-agnostic `chromium` entry to fall back on — and `playwright install`
+# is banned in CI by repo rule, so a VM baking exactly one revision hard-fails
+# e2e for every repo on a different pin. (An earlier version of this comment
+# claimed a repo that bumps Playwright "just has that one job fetch the new
+# revision" — that stopped being true when the per-job install was banned.)
+# The repos are not in lockstep: bonkey-cards-app is on 1.62.1 while
+# bonkey-puzzles-app and bonkey-math-app are still on 1.61.1. The revisions land
+# in separate directories and do not conflict. Drop a version from this list
+# only once no repo pins it.
 # ---------------------------------------------------------------------------
 set +e
-PLAYWRIGHT_VERSION="1.61.1"
+PLAYWRIGHT_VERSIONS=("1.62.1" "1.61.1")
 PW_BROWSERS_DIR="/opt/pw-browsers"
-PW_MARKER="$PW_BROWSERS_DIR/.baked-$PLAYWRIGHT_VERSION"
-log "Baking Playwright Chromium browser (v$PLAYWRIGHT_VERSION) into $PW_BROWSERS_DIR..."
 mkdir -p "$PW_BROWSERS_DIR"
 chown "$RUNNER_USER:$RUNNER_USER" "$PW_BROWSERS_DIR"
-if [[ -f "$PW_MARKER" ]]; then
-  log "Playwright Chromium v$PLAYWRIGHT_VERSION already baked — skipping."
-elif sudo -u "$RUNNER_USER" -H env "PLAYWRIGHT_BROWSERS_PATH=$PW_BROWSERS_DIR" \
-       npx -y "playwright@$PLAYWRIGHT_VERSION" install chromium; then
-  touch "$PW_MARKER"
-  log "Playwright Chromium baked OK."
-else
-  log "WARN: Playwright Chromium bake failed — per-job 'playwright install chromium' will cover it."
-fi
+for PLAYWRIGHT_VERSION in "$${PLAYWRIGHT_VERSIONS[@]}"; do
+  PW_MARKER="$PW_BROWSERS_DIR/.baked-$PLAYWRIGHT_VERSION"
+  log "Baking Playwright Chromium browser (v$PLAYWRIGHT_VERSION) into $PW_BROWSERS_DIR..."
+  if [[ -f "$PW_MARKER" ]]; then
+    log "Playwright Chromium v$PLAYWRIGHT_VERSION already baked — skipping."
+  elif sudo -u "$RUNNER_USER" -H env "PLAYWRIGHT_BROWSERS_PATH=$PW_BROWSERS_DIR" \
+         npx -y "playwright@$PLAYWRIGHT_VERSION" install chromium; then
+    touch "$PW_MARKER"
+    log "Playwright Chromium v$PLAYWRIGHT_VERSION baked OK."
+  else
+    log "WARN: Playwright Chromium v$PLAYWRIGHT_VERSION bake failed — jobs on that pin will fail e2e ('playwright install' is banned in CI)."
+  fi
+done
 chown -R "$RUNNER_USER:$RUNNER_USER" "$PW_BROWSERS_DIR" || true
 bake_env PLAYWRIGHT_BROWSERS_PATH "$PW_BROWSERS_DIR"
 set -e

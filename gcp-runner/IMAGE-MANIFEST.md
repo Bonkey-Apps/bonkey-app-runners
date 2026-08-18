@@ -22,12 +22,25 @@ bake miss degrades to today's behavior rather than breaking a job.
 | pnpm | `10.33.0` (== `packageManager`) | global npm | PATH | `setup-js` on-box check |
 | Playwright system libs | `chromium` deps (`playwright install-deps`) | system | — | (already baked) |
 | **GitHub CLI (`gh`)** | apt `stable` channel | system | PATH | `./.github/actions/ensure-gh` |
-| **Playwright Chromium browser** | keyed to `@playwright/test` `1.61.1` | `/opt/pw-browsers` | `PLAYWRIGHT_BROWSERS_PATH` (runner `.env`) | `playwright install chromium` (ci-web-e2e, ci-screenshots) |
+| **Playwright Chromium browser** | keyed to `@playwright/test` — **`1.62.1` _and_ `1.61.1`, both baked** | `/opt/pw-browsers` (one `chromium-<rev>/` per version) | `PLAYWRIGHT_BROWSERS_PATH` (runner `.env`) | `playwright install chromium` (ci-web-e2e, ci-screenshots) |
 | **Docker Engine** | Debian 12 apt (`docker.io`) | system | PATH; `runner` user in the `docker` group | any job shelling out to `docker`, incl. `build-docker-runner-image.yml` |
 
-Bump the Playwright pin in lockstep with the `@playwright/test` devDependency in
-the app repos (all three currently pin `1.61.1`); the per-version marker
-(`/opt/pw-browsers/.baked-<ver>`) forces a re-bake when it changes.
+**Playwright is baked once per pin in use across the app repos, not once
+overall** (BC-132). Playwright resolves its browser by *revision* —
+`playwright install` writes `chromium-<rev>/` and leaves no version-agnostic
+`chromium` entry — and the per-job `playwright install` is banned by repo rule,
+so a runner carrying exactly one revision hard-fails e2e for every repo pinned
+to a different `@playwright/test`. These runners serve all three app repos and
+the repos drift apart during an upgrade: `bonkey-cards-app` is on `1.62.1`
+while `bonkey-puzzles-app` and `bonkey-math-app` are still on `1.61.1`.
+
+The list lives in `PLAYWRIGHT_VERSIONS` in **both** `runner-startup.sh.tftpl`
+copies (root and `modules/runner-mig/`) and as
+`PLAYWRIGHT_VERSION` / `PLAYWRIGHT_VERSION_PREV` in
+`docker-runner/Dockerfile`. **Add** an entry when a repo moves to a new pin;
+**remove** one only once no repo pins it. The per-version marker
+(`/opt/pw-browsers/.baked-<ver>`) makes each bake idempotent and forces a
+re-bake when a version is added.
 
 ## Android SDK + emulator — `enable_android` runners only (#262/#267)
 
