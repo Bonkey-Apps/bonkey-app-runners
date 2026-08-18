@@ -63,7 +63,13 @@ apt-get install -y -q nodejs
 # make runner bring-up non-reproducible and risks an unpinned release
 # unexpectedly breaking jobs.
 npm install -g pnpm@10.33.0
-npx -y playwright@1.61.1 install-deps chromium || true
+# NOTE: this is `install-deps` (Chromium's OS libraries), NOT `install`
+# (the browser binary) — a JIT VM bakes no browser revision, so it cannot serve
+# an e2e job on its own (the per-job `playwright install` is banned by the app
+# repos' rules). Track the highest pin in use, since newer Chromium can need
+# newer libs; see IMAGE-MANIFEST.md for the per-pin browser bake that the
+# long-lived runners do.
+npx -y playwright@1.62.1 install-deps chromium || true
 
 # gcloud CLI (for self-deletion).
 if ! command -v gcloud &>/dev/null; then

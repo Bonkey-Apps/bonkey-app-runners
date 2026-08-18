@@ -173,10 +173,14 @@ local gate passes, only Actions fails, and it fails for every open PR until the
 image catches up.
 
 Rolling the local Docker runner: `docker compose pull`, then `docker compose up
--d`. Verify it actually moved — `up -d` has been observed to report `Recreate`
-and leave the container on the **old** image id. Compare `docker inspect -f
-'{{.Image}}' docker-runner-runner-1` against `docker images`, and use `up -d
---force-recreate` if they disagree.
+-d`. **A pulled image is not a replaced runner — verify before believing it.**
+Mid-roll the container has been seen still on the old image id while `docker
+images` already showed the new `:latest` (whether `up -d` had finished and
+failed to recreate, or was still in flight behind a multi-GB pull, was not
+established — so trust the check, not a theory). Compare `docker inspect -f
+'{{.Image}}' docker-runner-runner-1` against `docker images`, and confirm the
+change is actually inside the container (`docker exec … ls /opt/pw-browsers`).
+`up -d --force-recreate` resolves a mismatch.
 
 Which runner a job lands on is decided per repo by the `CI_RUNNER` Actions
 variable. `bonkey-cards-app` sets `["self-hosted"]` — the bare label — so its
