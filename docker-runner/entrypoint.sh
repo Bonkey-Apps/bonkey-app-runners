@@ -87,6 +87,35 @@ CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-${BONKEY_NATIVE_BUILD_
 export CMAKE_BUILD_PARALLEL_LEVEL
 log "BONKEY_NATIVE_BUILD_JOBS=${BONKEY_NATIVE_BUILD_JOBS} (CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}; note: neither reaches ninja under AGP's direct invocation — see docker-compose.yml's cpuset)"
 
+# --- Baked Playwright revisions (BC-144) -----------------------------------
+# A stale container is the failure this makes visible. `restart:
+# unless-stopped` re-runs the container from the image it was CREATED with,
+# so a published `:latest` reaches a host only via `docker compose pull` +
+# `up -d` (and CLAUDE.md's warning that "a pulled image is not a replaced
+# runner" is there because a recreate has been seen to silently not happen).
+#
+# On 2026-08-21 one org container still carried a pre-dual-bake image while a
+# sibling carried the new one. Both advertise the bare `self-hosted` label,
+# so bonkey-cards-app's jobs took either at random and `web e2e` passed or
+# failed by luck of the draw. Diagnosing it needed `docker exec` on the right
+# host, after guessing which host that was.
+#
+# Printing the revisions at registration puts them in the runner's own
+# startup log, so the next time an e2e dies on a missing
+# chromium_headless_shell-<rev>, the answer is one log away instead of an
+# archaeology session. Deliberately NOT fatal: a runner that can still build
+# and test is more useful than one that refuses to start, and the app repos'
+# jobs fail loudly on their own if the revision they need is absent.
+if [ -d "${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}" ]; then
+  baked="$(find "${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}" \
+             -mindepth 1 -maxdepth 1 -type d \
+             \( -name 'chromium-*' -o -name 'chromium_headless_shell-*' \) \
+             -printf '%f ' 2>/dev/null || true)"
+  log "baked Chromium: ${baked:-NONE FOUND}"
+else
+  log "baked Chromium: ${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers} does not exist"
+fi
+
 # --- Resolve a registration token ------------------------------------------
 if [ -z "${RUNNER_TOKEN:-}" ]; then
   [ -n "${GH_PAT:-}" ] || die "provide GH_PAT (org runner admin) or RUNNER_TOKEN"

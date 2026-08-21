@@ -144,13 +144,47 @@ RUN set -eux; \
     mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"; \
     npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium; \
     npx --yes "playwright@${PLAYWRIGHT_VERSION_PREV}" install --with-deps chromium; \
-    # Fail the BAKE if the second install did not add its own revision, rather
-    # than discovering it as a red e2e job on whichever repo runs first. Each
-    # version writes exactly one chromium-<rev>; two versions must leave two.
-    revs="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -mindepth 1 -maxdepth 1 -type d \
-              -name 'chromium-*' | wc -l)"; \
-    test "$revs" -ge 2 \
-      || { echo "expected 2 baked chromium revisions (${PLAYWRIGHT_VERSION} + ${PLAYWRIGHT_VERSION_PREV}), found ${revs}" >&2; exit 1; }; \
+    # Fail the BAKE rather than discovering it as a red e2e job on whichever
+    # repo runs first. This asks each pinned Playwright WHERE IT WILL LOOK and
+    # asserts that exact directory exists.
+    #
+    # Hardened after BC-144 (2026-08-21), though NOT because this check let
+    # that one through - it could not have, since it shipped in the same
+    # commit as the second bake and the stale image predated both. That
+    # outage was a container never recreated after the image was published
+    # (see the entrypoint's baked-revision banner and CLAUDE.md's "a pulled
+    # image is not a replaced runner"). These are two LATENT gaps found while
+    # investigating it, both of which would let a future bake pass wrongly:
+    #
+    #   - A COUNT cannot say WHICH revisions are present. `find -name
+    #     'chromium-*' | wc -l` >= 2 is satisfied by any two revisions, so an
+    #     image carrying two STALE ones would pass while the revision a repo
+    #     actually pins is absent.
+    #   - `chromium-<rev>` is not the only artifact. Headless runs launch
+    #     `chromium_headless_shell-<rev>`, a SEPARATE directory the
+    #     `chromium-*` glob never matched (underscore, not hyphen) - and it
+    #     is the one BC-144's failure named:
+    #       browserType.launch: Executable doesn't exist at
+    #       /opt/pw-browsers/chromium_headless_shell-1234/...
+    #     `playwright install chromium` does install both, so the installs
+    #     above were already right; only the assertion was blind to it.
+    #
+    # `install --dry-run <pkg>` prints "Install location: <dir>" for the
+    # revision THIS version resolves, so the check hardcodes no revision
+    # numbers and stays correct when a pin moves. Verified both directions
+    # against a real cache and an empty PLAYWRIGHT_BROWSERS_PATH: present ->
+    # exit 0 with both dirs logged; absent -> exit 1 naming the missing dir.
+    for v in "${PLAYWRIGHT_VERSION}" "${PLAYWRIGHT_VERSION_PREV}"; do \
+      for pkg in chromium chromium-headless-shell; do \
+        dir="$(npx --yes "playwright@${v}" install --dry-run "${pkg}" \
+                 | sed -n 's/.*Install location:[[:space:]]*//p' | head -1)"; \
+        test -n "${dir}" \
+          || { echo "could not resolve the ${pkg} install location for playwright@${v}" >&2; exit 1; }; \
+        test -d "${dir}" \
+          || { echo "playwright@${v} resolves ${pkg} to ${dir}, which the bake did not produce" >&2; exit 1; }; \
+        echo "baked: playwright@${v} ${pkg} -> ${dir}"; \
+      done; \
+    done; \
     chown -R runner:runner "${PLAYWRIGHT_BROWSERS_PATH}"; \
     rm -rf /var/lib/apt/lists/*
 
