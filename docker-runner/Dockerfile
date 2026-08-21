@@ -171,9 +171,14 @@ RUN set -eux; \
     #
     # `install --dry-run <pkg>` prints "Install location: <dir>" for the
     # revision THIS version resolves, so the check hardcodes no revision
-    # numbers and stays correct when a pin moves. Verified both directions
-    # against a real cache and an empty PLAYWRIGHT_BROWSERS_PATH: present ->
-    # exit 0 with both dirs logged; absent -> exit 1 naming the missing dir.
+    # numbers and stays correct when a pin moves.
+    #
+    # Verified in a real `docker build` on ubuntu/node, both directions:
+    # installing both pins -> exit 0 and /opt/pw-browsers holds chromium-1234,
+    # chromium-1228 and BOTH chromium_headless_shell-* ; installing only
+    # PLAYWRIGHT_VERSION_PREV (the stale-image shape) -> exit 1 on this
+    # check's own message, "playwright@1.62.1 resolves chromium to
+    # /opt/pw-browsers/chromium-1234, which the bake did not produce".
     for v in "${PLAYWRIGHT_VERSION}" "${PLAYWRIGHT_VERSION_PREV}"; do \
       for pkg in chromium chromium-headless-shell; do \
         dir="$(npx --yes "playwright@${v}" install --dry-run "${pkg}" \
