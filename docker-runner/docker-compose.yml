@@ -9,8 +9,9 @@
 # under Rosetta (enable "Use Rosetta" in Docker Desktop → Settings → General).
 # To run native arm64 instead, set RUNNER_PLATFORM=linux/arm64 in .env — but
 # note x64-only jobs then won't schedule on it.
-services:
-  runner:
+# Shared runner definition. Anchored so every runner service is byte-identical
+# except for its cpuset — see the note on cpuset below.
+x-runner-base: &runner
     build:
       context: .
       args:
@@ -27,18 +28,29 @@ services:
     # it locally under the same tag.
     image: ${RUNNER_IMAGE:-ghcr.io/bonkey-apps/bonkey-apps-runner:latest}
     platform: ${RUNNER_PLATFORM:-linux/amd64}
-    # Pins the CONTAINER to a smaller core SET — this is what actually
-    # throttles ninja's native-build concurrency. AGP invokes ninja directly,
-    # so neither Gradle's --max-workers nor CMAKE_BUILD_PARALLEL_LEVEL reach
-    # it (measured on bonkey-cards-app#1032: 3 release runs, 3 --max-workers
-    # settings, zero effect on concurrent clang++ count) — ninja instead picks
-    # its own -j from `nproc`. Docker's time-quota `cpus:` does NOT change
-    # what nproc reports inside the container (verified empirically — still
-    # reports the host's full core count under a `cpus` quota); only
-    # `cpuset:` (core pinning) does. Core-index string, e.g. "0-1" = 2 cores,
-    # "0-3" = 4 cores — keep BONKEY_NATIVE_BUILD_JOBS's default in entrypoint.sh
-    # in lockstep with however many cores this pins (currently 2).
-    cpuset: "${RUNNER_CPUSET:-0-1}"
+    # NOTE: `cpuset` is deliberately absent from this shared block — it is the
+    # one setting that must DIFFER per runner, so each service sets its own.
+    #
+    # Why cpuset at all: it pins the CONTAINER to a smaller core SET, and that
+    # is what actually throttles ninja's native-build concurrency. AGP invokes
+    # ninja directly, so neither Gradle's --max-workers nor
+    # CMAKE_BUILD_PARALLEL_LEVEL reach it (measured on bonkey-cards-app#1032:
+    # 3 release runs, 3 --max-workers settings, zero effect on concurrent
+    # clang++ count) — ninja instead picks its own -j from `nproc`. Docker's
+    # time-quota `cpus:` does NOT change what nproc reports inside the
+    # container (verified empirically — still reports the host's full core
+    # count under a `cpus` quota); only `cpuset:` (core pinning) does.
+    #
+    # Why the sets must be DISJOINT: `up --scale runner=N` applies ONE cpuset
+    # to every replica, so N runners all land on the SAME cores — N concurrent
+    # jobs contending for 2 cores while the rest of the host sits idle
+    # (observed 2026-08-23: two runners both pinned to 0-1 of a 24-core host,
+    # nproc=2 in each). That is why extra runners are separate SERVICES with
+    # their own cpuset rather than replicas. Do NOT use --scale here.
+    #
+    # Core-index string, e.g. "0-1" = 2 cores, "0-3" = 4 cores — keep
+    # BONKEY_NATIVE_BUILD_JOBS's default in entrypoint.sh in lockstep with
+    # however many cores EACH service pins (currently 2).
     # Ephemeral runners exit after one job; restart to pick up the next.
     restart: ${RUNNER_RESTART:-unless-stopped}
     stop_grace_period: 90s
@@ -49,3 +61,25 @@ services:
       RUNNER_LABELS: ${RUNNER_LABELS:-docker,docker-mac,local}
       RUNNER_GROUP: ${RUNNER_GROUP:-Default}
       RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-true}
+
+services:
+  runner:
+    <<: *runner
+    cpuset: "${RUNNER_CPUSET:-0-1}"
+
+  # Extra runners, off by default so a 2-core laptop keeps the single-runner
+  # behaviour with no flags. Each pins its OWN cores, so they run genuinely in
+  # parallel instead of contending:
+  #   docker compose --profile x2 up -d   # 2 runners: cores 0-1, 2-3
+  #   docker compose --profile x3 up -d   # 3 runners: adds cores 4-5
+  # Check the host has the cores first (`docker info --format '{{.NCPU}}'`)
+  # and override RUNNER_CPUSET* in .env if the layout differs.
+  runner-2:
+    <<: *runner
+    profiles: ["x2", "x3"]
+    cpuset: "${RUNNER_CPUSET_2:-2-3}"
+
+  runner-3:
+    <<: *runner
+    profiles: ["x3"]
+    cpuset: "${RUNNER_CPUSET_3:-4-5}"

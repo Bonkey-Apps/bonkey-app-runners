@@ -175,8 +175,20 @@ is the only fix that works end-to-end.
 Run **more than one** at a time for parallelism (one runner = one job at a time):
 
 ```bash
-docker compose up --build -d --scale runner=3
+docker compose --profile x2 up -d
 ```
+
+`--profile x2` starts 2 runners, `--profile x3` starts 3. Each is its own
+service pinned to its **own** cores (`0-1`, `2-3`, `4-5` by default), so they
+run in parallel rather than contending.
+
+**Do not use `--scale runner=N`.** Compose applies one `cpuset` to every
+replica, so scaled runners all land on the *same* two cores — N concurrent
+jobs fighting over 2 cores while the rest of the host idles. Confirmed on
+2026-08-23: two scaled runners were both pinned to `0-1` on a 24-core host,
+each reporting `nproc` = 2. Check the host actually has the cores
+(`docker info --format '{{.NCPU}}'`) and override `RUNNER_CPUSET`,
+`RUNNER_CPUSET_2`, `RUNNER_CPUSET_3` in `.env` if the layout differs.
 
 ## Configuration
 
