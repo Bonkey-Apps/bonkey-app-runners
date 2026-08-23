@@ -129,7 +129,7 @@ RUN set -eux; \
 # --with-deps installs the apt libs Chromium needs (Tier 3 web-local e2e +
 # screenshots). Owned by runner so jobs read it as a warm no-op.
 #
-# Why the revision COUNT is load-bearing (BC-132, BC-138): Playwright resolves
+# Why the baked REVISION is load-bearing (BC-132, BC-138): Playwright resolves
 # its browser by REVISION - `playwright install` writes
 # ${PLAYWRIGHT_BROWSERS_PATH}/chromium-<rev>/, and there is no version-agnostic
 # `chromium` entry to fall back on (the app repos' playwright.config.ts probes
@@ -145,13 +145,46 @@ RUN set -eux; \
 RUN set -eux; \
     mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"; \
     npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium; \
-    # Fail the BAKE if an install did not leave its revision, rather than
-    # discovering it as a red e2e job on whichever repo runs first. Each
-    # version writes exactly one chromium-<rev>, so N pins must leave N.
-    revs="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -mindepth 1 -maxdepth 1 -type d \
-              -name 'chromium-*' | wc -l)"; \
-    test "$revs" -ge 1 \
-      || { echo "expected 1 baked chromium revision (${PLAYWRIGHT_VERSION}), found ${revs}" >&2; exit 1; }; \
+    # Fail the BAKE rather than discovering it as a red e2e job on whichever
+    # repo runs first. This asks each pinned Playwright WHERE IT WILL LOOK and
+    # asserts that exact directory exists.
+    #
+    # Hardened after BC-144 (2026-08-21), though NOT because the check it
+    # replaces let that one through - that outage was a container never
+    # recreated after a new image was published (see the entrypoint's
+    # baked-revision banner and CLAUDE.md's "a pulled image is not a replaced
+    # runner"). These are two LATENT gaps found while investigating it, both
+    # of which would let a future bake pass wrongly:
+    #
+    #   - A COUNT cannot say WHICH revisions are present. `find -name
+    #     'chromium-*' | wc -l` >= N is satisfied by ANY N revisions, so an
+    #     image carrying a stale one passes while the revision a repo actually
+    #     pins is absent.
+    #   - `chromium-<rev>` is not the only artifact. Headless runs launch
+    #     `chromium_headless_shell-<rev>`, a SEPARATE directory the
+    #     `chromium-*` glob never matched (underscore, not hyphen) - and it
+    #     is the one BC-144's failure named:
+    #       browserType.launch: Executable doesn't exist at
+    #       /opt/pw-browsers/chromium_headless_shell-1234/...
+    #     `playwright install chromium` does install both, so the install
+    #     above was already right; only the assertion was blind to it.
+    #
+    # `install --dry-run <pkg>` prints "Install location: <dir>" for the
+    # revision THIS version resolves, so the check hardcodes no revision
+    # numbers and stays correct when a pin moves. The `for v in` list is the
+    # per-pin list of the standing rule above: when a repo adopts a new pin,
+    # add its own `playwright@<v> install` line AND an entry here.
+    for v in "${PLAYWRIGHT_VERSION}"; do \
+      for pkg in chromium chromium-headless-shell; do \
+        dir="$(npx --yes "playwright@${v}" install --dry-run "${pkg}" \
+                 | sed -n 's/.*Install location:[[:space:]]*//p' | head -1)"; \
+        test -n "${dir}" \
+          || { echo "could not resolve the ${pkg} install location for playwright@${v}" >&2; exit 1; }; \
+        test -d "${dir}" \
+          || { echo "playwright@${v} resolves ${pkg} to ${dir}, which the bake did not produce" >&2; exit 1; }; \
+        echo "baked: playwright@${v} ${pkg} -> ${dir}"; \
+      done; \
+    done; \
     chown -R runner:runner "${PLAYWRIGHT_BROWSERS_PATH}"; \
     rm -rf /var/lib/apt/lists/*
 
