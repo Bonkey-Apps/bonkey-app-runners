@@ -21,7 +21,7 @@ golden-image manifest + each repo's `package.json`):
 
 | Layer | Contents | Notes |
 |---|---|---|
-| **CI (all repos, always)** | Node 24, **pnpm 10.33.0**, **Playwright 1.62.1 _and_ 1.61.1** Chromium + OS libs (`/opt/pw-browsers`, one `chromium-<rev>/` per version — see below), GitHub CLI (`gh`), git, ripgrep, fd-find, jq, python3 | Serves typecheck / lint / format / `pnpm -r test` / web-export / Tier 3 web-local e2e / screenshots |
+| **CI (all repos, always)** | Node 24, **pnpm 10.33.0**, **Playwright 1.62.1** Chromium + OS libs (`/opt/pw-browsers`, one `chromium-<rev>/` per version — see below), GitHub CLI (`gh`), git, ripgrep, fd-find, jq, python3 | Serves typecheck / lint / format / `pnpm -r test` / web-export / Tier 3 web-local e2e / screenshots |
 | **Android build** (`INSTALL_ANDROID=true`, default) | OpenJDK 17 with **`JAVA_HOME` exported by `entrypoint.sh`** (so jobs can skip `actions/setup-java`; derived from the real `java`, so it is arch-correct and stays UNSET on a `INSTALL_ANDROID=false` image rather than pointing at a JDK that isn't there), Android command-line tools + platform-tools + `platforms;android-34` + `build-tools;34.0.0` (`/opt/android-sdk`), **bundletool 1.18.1** (`/opt/bundletool`) | Serves Gradle `bundleRelease` (AAB) jobs. **amd64 only** — the Android SDK ships x86_64 host tools; set `INSTALL_ANDROID=false` on arm64 |
 
 ### Why two Playwright versions are baked
@@ -35,12 +35,13 @@ there is no per-job fallback: a runner baking exactly one revision hard-fails
 e2e for every repo pinned to a different `@playwright/test`.
 
 This is an **org-level** runner — one container serves Puzzles, Cards and Math —
-and they are not all on the same pin (`bonkey-cards-app` is on 1.62.1;
-`bonkey-puzzles-app` and `bonkey-math-app` are still on 1.61.1). So the image
-bakes both, in separate `chromium-<rev>/` directories that do not conflict, and
-the build asserts that two revisions actually landed. Delete
-`PLAYWRIGHT_VERSION_PREV` and its `RUN` line once the last repo has moved
-(BC-132).
+and they can drift apart during an upgrade. The image therefore bakes **one
+Chromium per pin in use**, in separate `chromium-<rev>/` directories that do not
+conflict, and the build asserts that every expected revision actually landed.
+
+As of BC-138 all three repos are on 1.62.1, so there is a single entry. Add an
+ARG plus its `RUN` line when a repo adopts a new pin (BC-132 did this for
+1.61.1); remove one only once no repo pins it.
 
 ## What it is / isn't
 
@@ -193,7 +194,6 @@ All via `.env` (see `.env.example` for the full annotated list):
 | `RUNNER_VERSION` | `2.335.1` | `actions/runner` version — keep in lockstep with the GCE runners |
 | `PNPM_VERSION` | `10.33.0` | Baked pnpm (== each repo's `packageManager`) |
 | `PLAYWRIGHT_VERSION` | `1.62.1` | Primary baked Playwright (== `bonkey-cards-app`'s `@playwright/test`) |
-| `PLAYWRIGHT_VERSION_PREV` | `1.61.1` | Second baked Playwright, for the repos still on the old pin — see below |
 | `INSTALL_ANDROID` | `true` | Bake Java 17 + Android SDK + bundletool (amd64 only; `false` for lean/arm64) |
 | `RUNNER_PLATFORM` | `linux/amd64` | `linux/amd64` (→ `x64`) or `linux/arm64` |
 | `RUNNER_CPUSET` | `0-1` (2 cores) | Pins the container to a core SET (`cpuset`, not a time-quota `cpus` limit) — this is the lever that actually throttles ninja's native-build concurrency in an Expo/AGP build, since AGP invokes ninja directly and ninja picks its own `-j` from `nproc`. Keep `BONKEY_NATIVE_BUILD_JOBS`'s default in lockstep with however many cores this pins. |

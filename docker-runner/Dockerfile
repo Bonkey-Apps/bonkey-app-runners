@@ -12,8 +12,8 @@
 #   CI (all repos, unconditional):
 #     • Node 24, pnpm 10.33.0 (== packageManager)
 #     • Playwright Chromium browsers + their OS libs      → /opt/pw-browsers
-#       TWO revisions side by side: 1.62.1 (cards) and 1.61.1 (puzzles /
-#       math). See the bake layer below for why both.
+#       ONE revision: 1.62.1, the pin every app repo is on. See the bake
+#       layer below for why the count is load-bearing.
 #     • GitHub CLI (gh), git, ripgrep, fd-find, jq, python3
 #   Android BUILD (INSTALL_ANDROID=true, default):
 #     • OpenJDK 17 (JAVA_HOME exported at runtime by entrypoint.sh)
@@ -41,12 +41,11 @@ FROM ubuntu:24.04
 # --- Version pins (keep in lockstep with IMAGE-MANIFEST.md + package.json) ---
 ARG RUNNER_VERSION=2.335.1
 ARG PNPM_VERSION=10.33.0
-# Playwright is baked TWICE — the app repos are not all on the same version
-# (BC-132). Both installs land in the same PLAYWRIGHT_BROWSERS_PATH under their
-# own chromium-<revision>/ directory, so they coexist rather than overwrite.
-# Drop PLAYWRIGHT_VERSION_PREV once every repo is on the primary pin.
+# One Chromium per @playwright/test pin ACTUALLY IN USE across the org's app
+# repos. Cards, puzzles and math are all on 1.62.1 as of BC-138, so one entry
+# suffices. Add a second ARG plus its install line the moment any repo adopts a
+# different pin; remove it only when no repo pins it. See the bake layer below.
 ARG PLAYWRIGHT_VERSION=1.62.1
-ARG PLAYWRIGHT_VERSION_PREV=1.61.1
 # Android build toolchain (heavy, amd64-only) — set false for a lean JS/web image.
 ARG INSTALL_ANDROID=true
 ARG JAVA_VERSION=17
@@ -130,56 +129,52 @@ RUN set -eux; \
 # --with-deps installs the apt libs Chromium needs (Tier 3 web-local e2e +
 # screenshots). Owned by runner so jobs read it as a warm no-op.
 #
-# Why TWO versions (BC-132): Playwright resolves its browser by REVISION —
-# `playwright install` writes ${PLAYWRIGHT_BROWSERS_PATH}/chromium-<rev>/, and
-# there is no version-agnostic `chromium` entry to fall back on (the app repos'
-# playwright.config.ts probes for one and finds nothing, so resolution goes
-# through the revision). `playwright install` is BANNED in CI by repo rule, so
-# a runner baking exactly one revision hard-fails e2e for every repo pinned to
-# a different @playwright/test. bonkey-cards-app is moving to 1.62.1 while
-# bonkey-puzzles-app and bonkey-math-app stay on 1.61.1, and this is an
-# ORG-level runner serving all three — so "just bump it" is not available.
-# Delete the PREV install when the last repo moves.
+# Why the baked REVISION is load-bearing (BC-132, BC-138): Playwright resolves
+# its browser by REVISION - `playwright install` writes
+# ${PLAYWRIGHT_BROWSERS_PATH}/chromium-<rev>/, and there is no version-agnostic
+# `chromium` entry to fall back on (the app repos' playwright.config.ts probes
+# for one and finds nothing, so resolution goes through the revision). This is
+# an ORG-level runner serving cards, puzzles and math, so baking a revision no
+# repo pins wastes image size, while MISSING one a repo does pin hard-fails
+# that repo's e2e with no fallback.
+#
+# Standing rule: bake ONE Chromium PER PIN IN USE. Add on adoption (runner
+# image first, the app's package.json second), and remove only once no repo
+# pins it any more. BC-132 added 1.61.1 alongside 1.62.1 under that rule;
+# BC-138 removed it again once cards, puzzles and math were all on 1.62.1.
 RUN set -eux; \
     mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"; \
     npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium; \
-    npx --yes "playwright@${PLAYWRIGHT_VERSION_PREV}" install --with-deps chromium; \
     # Fail the BAKE rather than discovering it as a red e2e job on whichever
     # repo runs first. This asks each pinned Playwright WHERE IT WILL LOOK and
     # asserts that exact directory exists.
     #
-    # Hardened after BC-144 (2026-08-21), though NOT because this check let
-    # that one through - it could not have, since it shipped in the same
-    # commit as the second bake and the stale image predated both. That
-    # outage was a container never recreated after the image was published
-    # (see the entrypoint's baked-revision banner and CLAUDE.md's "a pulled
-    # image is not a replaced runner"). These are two LATENT gaps found while
-    # investigating it, both of which would let a future bake pass wrongly:
+    # Hardened after BC-144 (2026-08-21), though NOT because the check it
+    # replaces let that one through - that outage was a container never
+    # recreated after a new image was published (see the entrypoint's
+    # baked-revision banner and CLAUDE.md's "a pulled image is not a replaced
+    # runner"). These are two LATENT gaps found while investigating it, both
+    # of which would let a future bake pass wrongly:
     #
     #   - A COUNT cannot say WHICH revisions are present. `find -name
-    #     'chromium-*' | wc -l` >= 2 is satisfied by any two revisions, so an
-    #     image carrying two STALE ones would pass while the revision a repo
-    #     actually pins is absent.
+    #     'chromium-*' | wc -l` >= N is satisfied by ANY N revisions, so an
+    #     image carrying a stale one passes while the revision a repo actually
+    #     pins is absent.
     #   - `chromium-<rev>` is not the only artifact. Headless runs launch
     #     `chromium_headless_shell-<rev>`, a SEPARATE directory the
     #     `chromium-*` glob never matched (underscore, not hyphen) - and it
     #     is the one BC-144's failure named:
     #       browserType.launch: Executable doesn't exist at
     #       /opt/pw-browsers/chromium_headless_shell-1234/...
-    #     `playwright install chromium` does install both, so the installs
-    #     above were already right; only the assertion was blind to it.
+    #     `playwright install chromium` does install both, so the install
+    #     above was already right; only the assertion was blind to it.
     #
     # `install --dry-run <pkg>` prints "Install location: <dir>" for the
     # revision THIS version resolves, so the check hardcodes no revision
-    # numbers and stays correct when a pin moves.
-    #
-    # Verified in a real `docker build` on ubuntu/node, both directions:
-    # installing both pins -> exit 0 and /opt/pw-browsers holds chromium-1234,
-    # chromium-1228 and BOTH chromium_headless_shell-* ; installing only
-    # PLAYWRIGHT_VERSION_PREV (the stale-image shape) -> exit 1 on this
-    # check's own message, "playwright@1.62.1 resolves chromium to
-    # /opt/pw-browsers/chromium-1234, which the bake did not produce".
-    for v in "${PLAYWRIGHT_VERSION}" "${PLAYWRIGHT_VERSION_PREV}"; do \
+    # numbers and stays correct when a pin moves. The `for v in` list is the
+    # per-pin list of the standing rule above: when a repo adopts a new pin,
+    # add its own `playwright@<v> install` line AND an entry here.
+    for v in "${PLAYWRIGHT_VERSION}"; do \
       for pkg in chromium chromium-headless-shell; do \
         dir="$(npx --yes "playwright@${v}" install --dry-run "${pkg}" \
                  | sed -n 's/.*Install location:[[:space:]]*//p' | head -1)"; \

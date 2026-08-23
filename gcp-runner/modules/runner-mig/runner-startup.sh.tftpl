@@ -336,12 +336,13 @@ chown -R "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR"
 # claimed a repo that bumps Playwright "just has that one job fetch the new
 # revision" — that stopped being true when the per-job install was banned.)
 # The repos are not in lockstep: bonkey-cards-app is on 1.62.1 while
-# bonkey-puzzles-app and bonkey-math-app are still on 1.61.1. The revisions land
-# in separate directories and do not conflict. Drop a version from this list
-# only once no repo pins it.
+# bonkey-puzzles-app and bonkey-math-app are on it too as of BC-138, so the
+# list has a single entry. The revisions land in separate directories and do
+# not conflict. Add a version here the moment any repo adopts a different pin;
+# drop one only once no repo pins it.
 # ---------------------------------------------------------------------------
 set +e
-PLAYWRIGHT_VERSIONS=("1.62.1" "1.61.1")
+PLAYWRIGHT_VERSIONS=("1.62.1")
 PW_BROWSERS_DIR="/opt/pw-browsers"
 mkdir -p "$PW_BROWSERS_DIR"
 chown "$RUNNER_USER:$RUNNER_USER" "$PW_BROWSERS_DIR"
