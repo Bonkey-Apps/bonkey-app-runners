@@ -56,7 +56,8 @@ docker compose pull && docker compose up -d   # pull the published GHCR image
 docker compose up --build -d
 
 docker compose logs -f                         # watch registration + jobs
-docker compose up -d --scale runner=3           # N runners = N concurrent jobs
+docker compose --profile x2 up -d               # 2 runners, on disjoint cores
+docker compose --profile x3 up -d               # 3 runners, on disjoint cores
 docker compose down                             # deregisters cleanly on stop
 ```
 
