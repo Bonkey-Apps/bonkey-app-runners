@@ -12,8 +12,8 @@
 #   CI (all repos, unconditional):
 #     • Node 24, pnpm 10.33.0 (== packageManager)
 #     • Playwright Chromium browsers + their OS libs      → /opt/pw-browsers
-#       TWO revisions side by side: 1.62.1 (cards) and 1.61.1 (puzzles /
-#       math). See the bake layer below for why both.
+#       ONE revision: 1.62.1, the pin every app repo is on. See the bake
+#       layer below for why the count is load-bearing.
 #     • GitHub CLI (gh), git, ripgrep, fd-find, jq, python3
 #   Android BUILD (INSTALL_ANDROID=true, default):
 #     • OpenJDK 17 (JAVA_HOME exported at runtime by entrypoint.sh)
@@ -41,12 +41,11 @@ FROM ubuntu:24.04
 # --- Version pins (keep in lockstep with IMAGE-MANIFEST.md + package.json) ---
 ARG RUNNER_VERSION=2.335.1
 ARG PNPM_VERSION=10.33.0
-# Playwright is baked TWICE — the app repos are not all on the same version
-# (BC-132). Both installs land in the same PLAYWRIGHT_BROWSERS_PATH under their
-# own chromium-<revision>/ directory, so they coexist rather than overwrite.
-# Drop PLAYWRIGHT_VERSION_PREV once every repo is on the primary pin.
+# One Chromium per @playwright/test pin ACTUALLY IN USE across the org's app
+# repos. Cards, puzzles and math are all on 1.62.1 as of BC-138, so one entry
+# suffices. Add a second ARG plus its install line the moment any repo adopts a
+# different pin; remove it only when no repo pins it. See the bake layer below.
 ARG PLAYWRIGHT_VERSION=1.62.1
-ARG PLAYWRIGHT_VERSION_PREV=1.61.1
 # Android build toolchain (heavy, amd64-only) — set false for a lean JS/web image.
 ARG INSTALL_ANDROID=true
 ARG JAVA_VERSION=17
@@ -130,27 +129,29 @@ RUN set -eux; \
 # --with-deps installs the apt libs Chromium needs (Tier 3 web-local e2e +
 # screenshots). Owned by runner so jobs read it as a warm no-op.
 #
-# Why TWO versions (BC-132): Playwright resolves its browser by REVISION —
-# `playwright install` writes ${PLAYWRIGHT_BROWSERS_PATH}/chromium-<rev>/, and
-# there is no version-agnostic `chromium` entry to fall back on (the app repos'
-# playwright.config.ts probes for one and finds nothing, so resolution goes
-# through the revision). `playwright install` is BANNED in CI by repo rule, so
-# a runner baking exactly one revision hard-fails e2e for every repo pinned to
-# a different @playwright/test. bonkey-cards-app is moving to 1.62.1 while
-# bonkey-puzzles-app and bonkey-math-app stay on 1.61.1, and this is an
-# ORG-level runner serving all three — so "just bump it" is not available.
-# Delete the PREV install when the last repo moves.
+# Why the revision COUNT is load-bearing (BC-132, BC-138): Playwright resolves
+# its browser by REVISION - `playwright install` writes
+# ${PLAYWRIGHT_BROWSERS_PATH}/chromium-<rev>/, and there is no version-agnostic
+# `chromium` entry to fall back on (the app repos' playwright.config.ts probes
+# for one and finds nothing, so resolution goes through the revision). This is
+# an ORG-level runner serving cards, puzzles and math, so baking a revision no
+# repo pins wastes image size, while MISSING one a repo does pin hard-fails
+# that repo's e2e with no fallback.
+#
+# Standing rule: bake ONE Chromium PER PIN IN USE. Add on adoption (runner
+# image first, the app's package.json second), and remove only once no repo
+# pins it any more. BC-132 added 1.61.1 alongside 1.62.1 under that rule;
+# BC-138 removed it again once cards, puzzles and math were all on 1.62.1.
 RUN set -eux; \
     mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"; \
     npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium; \
-    npx --yes "playwright@${PLAYWRIGHT_VERSION_PREV}" install --with-deps chromium; \
-    # Fail the BAKE if the second install did not add its own revision, rather
-    # than discovering it as a red e2e job on whichever repo runs first. Each
-    # version writes exactly one chromium-<rev>; two versions must leave two.
+    # Fail the BAKE if an install did not leave its revision, rather than
+    # discovering it as a red e2e job on whichever repo runs first. Each
+    # version writes exactly one chromium-<rev>, so N pins must leave N.
     revs="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -mindepth 1 -maxdepth 1 -type d \
               -name 'chromium-*' | wc -l)"; \
-    test "$revs" -ge 2 \
-      || { echo "expected 2 baked chromium revisions (${PLAYWRIGHT_VERSION} + ${PLAYWRIGHT_VERSION_PREV}), found ${revs}" >&2; exit 1; }; \
+    test "$revs" -ge 1 \
+      || { echo "expected 1 baked chromium revision (${PLAYWRIGHT_VERSION}), found ${revs}" >&2; exit 1; }; \
     chown -R runner:runner "${PLAYWRIGHT_BROWSERS_PATH}"; \
     rm -rf /var/lib/apt/lists/*
 

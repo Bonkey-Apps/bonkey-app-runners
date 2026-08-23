@@ -159,8 +159,9 @@ app repos' own rules. So a mismatched pin has no fallback at all.
 
 Because this is an **org-level** runner (one image serves Puzzles, Cards and
 Math) and those repos drift apart during an upgrade, the runner bakes **one
-Chromium per pin in use, not one overall**: `PLAYWRIGHT_VERSION` +
-`PLAYWRIGHT_VERSION_PREV` in `docker-runner/Dockerfile`, and a
+Chromium per pin in use, not one overall**: `PLAYWRIGHT_VERSION` (plus one
+further ARG + install line per additional pin) in `docker-runner/Dockerfile`,
+and a
 `PLAYWRIGHT_VERSIONS` array in **both** `runner-startup.sh.tftpl` copies. Add
 an entry when a repo adopts a new pin; remove one only once no repo pins it.
 
