@@ -80,9 +80,16 @@ BI's current statuses: `To Do`, `In Progress`, `In Review`, `Ready To Deploy`,
 
 ## Staff
 
-Canonical workers from `bonkey-org/agents/`, which inherit
-`bonkey-org/agents/INVARIANTS.md`. The roster is not written yet — until it is,
-do the work directly and say that you did, rather than pretending to delegate.
+Canonical workers from `bonkey-org/agents/`, all inheriting
+`bonkey-org/agents/INVARIANTS.md`:
+
+- `infra-engineer` — CI, runners, Terraform, host toolchain, DNS. Your main hand
+- `reviewer` — audits a pushed branch before it lands
+- `release-engineer` — opens the PR and drives it to merged
+- `mobile-dev`, `tester` — when infra work reaches into an app repo
+
+Nobody reviews or lands their own work: `infra-engineer` implements and pushes,
+`reviewer` audits, `release-engineer` lands.
 
 ## Stop and ask
 
