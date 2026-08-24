@@ -43,15 +43,49 @@ edit. You do not get to quietly rewrite everyone else's rules.
 
 ## The two lanes
 
-**Incident — no gate.** Act immediately, report afterwards. Qualifying
-conditions are enumerated, and nothing else qualifies:
+**Incident — no gate.** Act immediately, report afterwards. Mark the issue
+with the `incident` label (ADR-0006 — a label, not a swimlane).
 
-- CI failing on `main` in any product repo
-- Self-hosted runners offline or not picking up jobs
-- DNS not resolving on the home network
+An issue qualifies **only** if it matches one of these, verified rather than
+assumed. Check the named oracle before you call something an incident:
 
-Your own sense that something is urgent does **not** make it an incident. If it
-is not on that list, it is a Change.
+| # | Condition | How you verify it |
+| --- | --- | --- |
+| 1 | CI is failing on `main` in a product repo | `gh run list --branch main --limit 5` on that repo shows a failed required check. A red run on a PR branch is not this |
+| 2 | Self-hosted runners are offline or not picking up jobs | The runner is offline in the org's runner list, or a queued job has sat unclaimed while the fleet shows idle. A slow job is not this |
+| 3 | DNS is not resolving on the home network | A query through the **system resolver** fails or is answered by something other than the Pi-hole. Test the resolver a client actually uses — not `-Server 10.77.77.10`, which can look healthy while the router's IPv6 DNS wins |
+| 4 | A merge to `main` broke a product's build or shipped app | Reproduced on `main`, not inferred from a report |
+
+Nothing else qualifies. Specifically **not** incidents, no matter how they feel:
+
+- A single flaky or slow CI run
+- A failure on a PR branch
+- Quota pressure, cost, or a nearly-full disk
+- A product manager saying something is urgent
+- Anything you found while looking for something else
+
+If it is not on the list, it is a Change and it waits for the gate. When it is
+genuinely close to the line, say which condition you think it matches and why,
+and treat it as a Change until told otherwise — the cost of waiting is a delay,
+and the cost of a wrongly-claimed incident is that the gate stops meaning
+anything.
+
+**Destructive actions stay gated inside an incident.** Being down is a reason to
+move fast on reversible things, never a licence for irreversible ones:
+
+| Do it | Propose and wait |
+| --- | --- |
+| Restart a service or runner | `terraform apply` that replaces or recreates |
+| Re-run a job | `terraform destroy` |
+| Re-register a runner | Delete a VM, disk or image |
+| Clear a cache | Recreate the Pi-hole VM or reset its config |
+| Roll back to a known-good commit by reverting forward | Revoke or rotate credentials |
+| | Force push, branch deletion, history rewrite |
+
+**Afterwards, always:** file the issue if you acted before one existed, label it
+`incident`, and report what broke, what you did, and how you verified it is
+fixed. An incident with no written trace is indistinguishable from an agent
+doing whatever it wanted.
 
 **Change — gated.** Everything planned. Work it only once the owner has
 released it. Until the BI board has a `Ready` column (see BI-3), treat "the
