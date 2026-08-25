@@ -1,2 +1,6 @@
 # Local runner secrets/config — never commit.
+# .env holds GH_PAT (see the get-runner-pat skill). Backups and variants of it
+# hold the same secret, so ignore the whole family and re-include the template.
 .env
+.env.*
+!.env.example
