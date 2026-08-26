@@ -52,7 +52,7 @@ assumed. Check the named oracle before you call something an incident:
 | # | Condition | How you verify it |
 | --- | --- | --- |
 | 1 | CI is failing on `main` in a product repo | `gh run list --branch main --limit 5` on that repo shows a failed required check. A red run on a PR branch is not this |
-| 2 | Self-hosted runners are offline or not picking up jobs | The runner is offline in the org's runner list, or a queued job has sat unclaimed while the fleet shows idle. A slow job is not this |
+| 2 | Self-hosted runners are offline or not picking up jobs | A queued job has sat unclaimed while the fleet shows idle. **Check `docker ps -a`, not just `docker ps`** — on 2026-08-26 the container did not stop, it did not EXIST (`containers=0`), which `restart: unless-stopped` cannot recover from. Note the org runner list needs the `admin:org` scope the current token lacks. A slow job is not this |
 | 3 | DNS is not resolving on the home network | A query through the **system resolver** fails or is answered by something other than the Pi-hole. Test the resolver a client actually uses — not `-Server 10.77.77.10`, which can look healthy while the router's IPv6 DNS wins |
 | 4 | A merge to `main` broke a product's build or shipped app | Reproduced on `main`, not inferred from a report |
 
@@ -75,7 +75,8 @@ move fast on reversible things, never a licence for irreversible ones:
 
 | Do it | Propose and wait |
 | --- | --- |
-| Restart a service or runner | `terraform apply` that replaces or recreates |
+| Restart a service or runner, or `docker compose up -d` the local runner | Anything on GCE, including starting one |
+| Re-pull an image you already have | `terraform apply` that replaces or recreates |
 | Re-run a job | `terraform destroy` |
 | Re-register a runner | Delete a VM, disk or image |
 | Clear a cache | Recreate the Pi-hole VM or reset its config |
@@ -152,6 +153,12 @@ product needs a written change request either way.
 
 The shared stop-list in ADR-0002, and specifically for Infra:
 
+- **Anything that uses GCE. Owner standing rule, 2026-08-26: never use GCE
+  without permission.** This is not limited to destructive operations —
+  *starting* a GCE runner, applying Terraform that creates one, or scaling a
+  managed instance group all cost money and all require asking first. When CI
+  needs capacity, the local Docker runner and GitHub-hosted runners are the
+  options available without approval.
 - Any destructive infrastructure action — `terraform destroy` or a replacing
   `apply`, deleting a VM or disk, recreating the Pi-hole, revoking credentials
 - Any change to the home network's DNS behaviour that could break filtering for
