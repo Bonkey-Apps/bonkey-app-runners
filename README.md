@@ -36,3 +36,50 @@ persistently if you want standing local capacity.
 This repo's content was migrated from `Bonkey-Apps/bonkey-puzzles-app`'s
 `infra/docker-runner/` and `infra/gcp-runner/` directories (see that repo's
 git history for the pre-migration history of these files).
+
+
+## Runner liveness (BI-26)
+
+`scripts/Watch-Runner.ps1` runs two independent checks. They are separate
+because they fail differently.
+
+**1. Self-heal.** If the container is absent, recreate it with
+`docker compose up -d`.
+
+The check is `docker ps -a`, not `docker ps`, and that distinction is the whole
+point. On 2026-08-26 the container had been **removed**, not stopped.
+`restart: unless-stopped` recovers a stopped container and does nothing for a
+removed one, so CI queued for **19 hours** across three repos with every
+dashboard green — queued reads as *busy*, not *broken*.
+
+**2. Stuck queue.** Warn when work is waiting and nothing is starting.
+
+A backlog is not a fault: one ephemeral runner drains strictly one job at a
+time, so a deep queue is normal. The signal that separates *busy* from *dead*
+is that a draining fleet keeps **starting** jobs. So the alert requires **both**
+`oldest queued > 60m` **and** `nothing started for 30m`. Either alone is noise —
+age alone fires on a legitimate backlog, and a presence check is useless under
+`RUNNER_EPHEMERAL=true`, where "no runner registered right now" is normal.
+
+Check 2 also covers what check 1 cannot: a runner that exists but cannot claim
+jobs, through a label mismatch or a wedged process.
+
+Log: `%ProgramData%onkeyunner-watch.log`.
+
+### Installing
+
+Deliberately **not** automatic — a scheduled task is a persistent change to the
+host. Run elevated:
+
+```powershell
+.\scripts\Register-RunnerWatch.ps1          # every 10 minutes
+.\scripts\Register-RunnerWatch.ps1 -Remove  # uninstall
+```
+
+Dry run first if you want to see it decide without acting:
+
+```powershell
+.\scripts\Watch-Runner.ps1 -WhatIf
+```
+
+Uses no GCE, per the owner's standing rule.
