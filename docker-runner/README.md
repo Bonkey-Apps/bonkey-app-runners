@@ -248,8 +248,8 @@ All via `.env` (see `.env.example` for the full annotated list):
 | `GH_PAT` | — | Org runner-admin PAT (or use `RUNNER_TOKEN`) |
 | `RUNNER_TOKEN` | — | Pre-minted org registration token (alternative to `GH_PAT`) |
 | `GITHUB_ORG` | `Bonkey-Apps` | Org to register under |
-| `RUNNER_NAME` | `docker-mac-<rand>` | Runner name shown in settings |
-| `RUNNER_LABELS` | `docker,docker-mac,local` | Extra labels (arch `x64`/`arm64` is added automatically) |
+| `RUNNER_NAME` | `bonkey-runner-<rand>` | Runner name shown in settings |
+| `RUNNER_LABELS` | `docker,local` | Extra labels (arch `x64`/`arm64` is added automatically) |
 | `RUNNER_GROUP` | `Default` | Org runner group |
 | `RUNNER_EPHEMERAL` | `true` | One job then exit (recommended) |
 | `RUNNER_VERSION` | `2.335.1` | `actions/runner` version — keep in lockstep with the GCE runners |

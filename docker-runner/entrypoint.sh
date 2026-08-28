@@ -13,8 +13,8 @@
 #
 # Config env (all optional, sane defaults):
 #   GITHUB_ORG      org login          (default: Bonkey-Apps)
-#   RUNNER_NAME     runner name        (default: docker-mac-<short-random>)
-#   RUNNER_LABELS   extra labels CSV   (default: docker,docker-mac,local)
+#   RUNNER_NAME     runner name        (default: bonkey-runner-<short-random>)
+#   RUNNER_LABELS   extra labels CSV   (default: docker,local)
 #   RUNNER_GROUP    runner group name  (default: Default)
 #   RUNNER_EPHEMERAL true|false        (default: true — one job then exit)
 #   RUNNER_REPLACE   true|false        (default: true — replace a same-named runner)
@@ -35,10 +35,10 @@ RUNNER_URL="https://github.com/${GITHUB_ORG}"
 # otherwise propagate as a script-ending failure even though the random suffix
 # came out fine.
 RAND_SUFFIX="$(tr -dc 'a-z0-9' </dev/urandom | head -c6 || true)"
-RUNNER_NAME="${RUNNER_NAME:-docker-mac-${RAND_SUFFIX}}"
+RUNNER_NAME="${RUNNER_NAME:-bonkey-runner-${RAND_SUFFIX}}"
 # Base labels mirror the CLAUDE.md taxonomy; x64/arm64 is added automatically
 # by config.sh from the runner's own arch. Add local Docker capability labels.
-RUNNER_LABELS="${RUNNER_LABELS:-docker,docker-mac,local}"
+RUNNER_LABELS="${RUNNER_LABELS:-docker,local}"
 RUNNER_GROUP="${RUNNER_GROUP:-Default}"
 RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-true}"
 RUNNER_REPLACE="${RUNNER_REPLACE:-true}"

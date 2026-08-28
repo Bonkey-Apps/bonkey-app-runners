@@ -110,7 +110,7 @@ x-runner-base: &runner
       - .env
     environment:
       GITHUB_ORG: ${GITHUB_ORG:-Bonkey-Apps}
-      RUNNER_LABELS: ${RUNNER_LABELS:-docker,docker-mac,local}
+      RUNNER_LABELS: ${RUNNER_LABELS:-docker,local}
       RUNNER_GROUP: ${RUNNER_GROUP:-Default}
       RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-true}
       # Absolute -Xmx, deliberately not a percentage. Measured on Docker
