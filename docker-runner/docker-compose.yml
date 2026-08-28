@@ -86,23 +86,52 @@ x-runner-base: &runner
     #                         -------
     #                         ~7 GiB   -- which does not fit in 6g, and does in 8g.
     #
-    # Why CAPPED at 8g rather than raised further: the Docker VM has 15.31 GiB
-    # total, and this host also runs the household Pi-hole VM (4 GiB) plus
-    # Docker Desktop itself. 8g leaves real headroom; going higher trades a
-    # legible container OOM for host-wide pressure, which is far harder to
-    # diagnose. If a build needs more than 8g, the build is the thing to fix.
+    # RAISED 8g -> 12g by owner decision, 2026-08-28 (BI-27), after a SECOND
+    # OOM kill at 8g. The 8g arithmetic above was measured on the phase that
+    # died in 0.11.27; the phase that dies now is a different one, and the
+    # per-process table from the kernel dump prices it properly:
+    #
+    #   JVMs      3 procs   4621 MiB   (2986 + 1530 + 105 -- THREE, not one)
+    #   clang++  14 procs   3378 MiB   (avg 241 MiB, max 678 -- not ~1 GiB each)
+    #   ninja                  4 MiB
+    #                       --------
+    #                       8003 MiB   = 7.82 GiB against an 8 GiB cap
+    #
+    # It was not one heavy process overrunning; it was the sum arriving exactly
+    # at the wall. 12g leaves ~4.2 GiB of headroom on the same workload.
+    #
+    # What the previous "capped at 8g" reasoning got right and wrong: the
+    # caution about host-wide pressure is real and still applies. But the cap
+    # was ALSO justified by fitting two runners at 8g -- and only one has ever
+    # been started (runner-2/runner-3 sit behind the x2/x3 profiles, off by
+    # default). Sizing one runner for a second that does not exist bought
+    # nothing and cost two 100-minute release builds.
+    #
+    # Measured before raising, on this host: Docker VM 15,674 MiB total /
+    # 14,427 MiB available; Windows host 31.38 GB total / 13.78 GB free.
+    # Raising this does not enlarge the VM -- it lets the container use more of
+    # the VM it already has -- so the ceiling is still the VM's 15.31 GiB.
+    #
+    # NOT verified: whether the household Pi-hole VM is currently running.
+    # `Get-VM` returned no rows, which on Windows can mean no VMs OR no
+    # privilege, so treat that as unknown rather than as "it is off". The host
+    # free figure above is measured with whatever is actually running.
+    #
+    # If a build OOMs at 12g, do NOT raise again -- the next lever is reducing
+    # RESIDENCY (fewer/smaller daemons) or narrowing RUNNER_CPUSET so nproc
+    # bounds ninja. See rules/build-concurrency.md in bonkey-org.
     #
     # NOTE the same trap documented below for the JVM applies to Node, and Node
     # is what died: runtimes here size themselves from the VM's 15.31 GiB, not
     # from this limit. Node happens to default to ~4 GiB so the arithmetic above
     # holds, but nothing ENFORCES it. If this recurs, cap it explicitly with
     # NODE_OPTIONS=--max-old-space-size=<MiB> rather than raising mem_limit again.
-    mem_limit: ${RUNNER_MEM_LIMIT:-8g}
+    mem_limit: ${RUNNER_MEM_LIMIT:-12g}
     # Equal to mem_limit == container swap disabled. The VM has only 4 GiB of
     # swap in total, so letting each runner swap its whole limit would oversell
     # it several times over and trade a fast, legible OOM for host-wide
     # thrashing -- the "job died at ~600s, log says nothing" failure mode.
-    memswap_limit: ${RUNNER_MEM_LIMIT:-6g}
+    memswap_limit: ${RUNNER_MEM_LIMIT:-12g}
     # Ephemeral runners exit after one job; restart to pick up the next.
     restart: ${RUNNER_RESTART:-unless-stopped}
     stop_grace_period: 90s
