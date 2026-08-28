@@ -70,16 +70,6 @@ docker compose --profile x3 up -d               # 3 runners, on disjoint cores
 docker compose down                             # deregisters cleanly on stop
 ```
 
-Behind a corporate TLS-inspecting proxy, the committed `Dockerfile` will fail
-(neither the build-time downloads nor the runner binary's own connection to
-GitHub can validate the proxy's re-signed certs). See
-`docker-runner/README.md`'s "Local build (behind a corporate TLS-inspecting
-proxy)" section for the `Dockerfile.local` + CA-trust +
-`docker-compose.override.yml` workaround — all three files are personal,
-per-machine, and must go in `.git/info/exclude`, never `.gitignore` or a
-commit, since the committed `Dockerfile` must stay portable for machines that
-aren't behind that proxy.
-
 ### `gcp-runner/`
 
 Via the `deploy-gcp-runner.yml` workflow (`workflow_dispatch`): choose

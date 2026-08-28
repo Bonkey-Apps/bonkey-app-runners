@@ -100,66 +100,6 @@ Tear down (deregisters cleanly on stop):
 docker compose down
 ```
 
-## Local build (behind a corporate TLS-inspecting proxy)
-
-If your machine sits behind a corporate proxy that MITMs HTTPS (Netskope, Zscaler,
-Palo Alto, etc. — check `security find-certificate -a
-/Library/Keychains/System.keychain` for names like your company's), the
-**committed** `Dockerfile` will fail: the container's OS trust store doesn't
-know about the proxy's re-signing CA that your host already trusts. Both apt/curl
-downloads at build time *and* the runner binary itself at runtime need this.
-`docker compose pull` (GHCR) sidesteps the problem entirely if the image is
-published — try that first.
-
-If you must build locally, **never edit the committed `Dockerfile`** with
-machine-specific trust — it's shared by the whole org and any dev without your
-proxy. Instead:
-
-1. Export the host's trusted root CAs to a local, gitignored file (the
-   command below is macOS; on Windows use `certutil -generateSSTFromWU` or
-   export from `certmgr.msc`):
-   ```bash
-   security find-certificate -a -p /Library/Keychains/System.keychain \
-     > docker-runner/system-roots.pem.local-build-only
-   ```
-2. Copy `Dockerfile` → `Dockerfile.local` and add a CA-trust stage right after
-   the `ENV` block (before any `apt-get`/`curl`):
-   ```dockerfile
-   COPY system-roots.pem.local-build-only /usr/local/share/ca-certificates/local-system-roots.crt
-   RUN apt-get update -q \
-       && apt-get install -y -q --no-install-recommends ca-certificates \
-       && update-ca-certificates \
-       && rm -rf /var/lib/apt/lists/*
-   ```
-   (Also worth defaulting `ARG INSTALL_ANDROID=false` in `Dockerfile.local` —
-   `sdkmanager` is a JVM tool with its own trust store, unvalidated with this
-   fix.)
-3. Add `Dockerfile.local` and `system-roots.pem.local-build-only` to
-   `.git/info/exclude` (NOT `.gitignore` — this is a personal, per-machine
-   exclusion, not a repo-wide rule) so `git status` stays clean and neither
-   file is ever accidentally committed.
-4. Create `docker-runner/docker-compose.override.yml` (also
-   `.git/info/exclude`'d) so `docker compose up --build` / `docker compose
-   build` use `Dockerfile.local` automatically — no manual `-f` flag to
-   remember, and no risk of swapping files in place (which defeats the whole
-   point: the committed `Dockerfile` must stay portable):
-   ```yaml
-   services:
-     runner:
-       build:
-         dockerfile: Dockerfile.local
-   ```
-   Compose merges `docker-compose.override.yml` on top of `docker-compose.yml`
-   automatically — no `-f` flags needed on the CLI.
-
-**Why not just `curl -k` / disable TLS verification everywhere?** It covers
-apt/curl/npm at build time, but the actual runner process
-(`Runner.Listener`, a compiled .NET binary) validates TLS against the OS trust
-store at *runtime* to hold its connection to GitHub's Actions service, and
-has no insecure-mode flag — so `-k`-style flags alone leave the container
-completely unable to register or run jobs. Trusting the CA once, properly,
-is the only fix that works end-to-end.
-
 ## How it works
 
 1. **`entrypoint.sh`** exchanges `GH_PAT` for a short-lived **org registration
