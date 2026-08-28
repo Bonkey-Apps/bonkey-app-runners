@@ -12,8 +12,9 @@ application code lives here. It was migrated out of `bonkey-puzzles-app`'s
 
 Two independent runner mechanisms live side by side:
 
-- **`docker-runner/`** — a containerised runner for any Mac (Docker Desktop or
-  Rancher Desktop). Registers at the **GitHub organisation** layer
+- **`docker-runner/`** — a containerised runner for any Docker host (Docker
+  Desktop or Rancher Desktop; the image is Linux/amd64, so the host OS only has
+  to run Docker). Registers at the **GitHub organisation** layer
   (`https://github.com/Bonkey-Apps`), so one running container serves CI for
   any repo in the org.
 - **`gcp-runner/`** — Terraform for GCE-hosted runners. A live root config
@@ -38,8 +39,16 @@ sync — they currently duplicate the same variables rather than all
 consuming the module (see "Duplicated root vs. module" below).
 
 The local Docker runner is unaffected by this policy — it runs on a
-developer's own Mac (not billed GCE compute), so leaving it up persistently is
-fine.
+developer's own desktop (not billed GCE compute), so leaving it up persistently
+is fine.
+
+**Current deployment, 2026-08-27:** one container, `bonkey-runner-01`, on a
+Windows 11 host under Docker Desktop (24 CPU, 16.4 GB to the VM), running
+Ubuntu 24.04 inside. `runner-2` and `runner-3` exist in `docker-compose.yml`
+but sit behind the `x2`/`x3` profiles and are **off by default**, so total
+org self-hosted capacity is **one concurrent job** shared by all three
+products. A second runner does not currently fit in the VM's memory — the
+runner's own `mem_limit` is 8g and two would exceed it.
 
 ## Commands
 
@@ -184,10 +193,26 @@ established — so trust the check, not a theory). Compare `docker inspect -f
 change is actually inside the container (`docker exec … ls /opt/pw-browsers`).
 `up -d --force-recreate` resolves a mismatch.
 
-Which runner a job lands on is decided per repo by the `CI_RUNNER` Actions
-variable. `bonkey-cards-app` sets `["self-hosted"]` — the bare label — so its
-jobs take *any* org runner, including a developer's local Docker one. This repo
-sets nothing and falls back to `ubuntu-latest`.
+Which runner a job lands on is decided per job by its `runs-on:`, which reads a
+`CI_RUNNER*` Actions variable **with a fallback baked into the workflow**. The
+fallback is usually what decides, because most of these variables are unset.
+
+Verified 2026-08-27:
+
+| repo | variables set | reaches the self-hosted runner via |
+| --- | --- | --- |
+| `bonkey-cards-app` | **none** | the *fallback* in `vars.CI_RUNNER_LINUX \|\| '["self-hosted","linux","x64"]'` |
+| `bonkey-math-app` | `CI_RUNNER=["self-hosted"]` | the variable |
+| `bonkey-puzzles-app` | `CI_RUNNER`, `CI_RUNNER_HEAVY` self-hosted; `CI_RUNNER_LIGHT` ubuntu-latest | the variables, tiered |
+| `bonkey-app-runners` | `CI_RUNNER=["ubuntu-latest"]` | never |
+
+**Listing variables under-reports — the absent variable is the dangerous one.**
+`gh variable list` shows `bonkey-cards-app` completely clean, and it is not: its
+release builds have always run on the self-hosted fleet, via an unset variable's
+fallback, with nothing recording that anywhere. Note the asymmetry inside a
+single Cards workflow file — `CI_RUNNER` falls back to `ubuntu-latest` while
+`CI_RUNNER_LINUX` falls back to `self-hosted`. **Enumerate the fallbacks at the
+use sites, not the configured variables.**
 
 ### Host readers/writer lock (GCE, KVM/emulator jobs)
 

@@ -1,7 +1,8 @@
-# Local Docker runner (Mac) — Bonkey-Apps org layer
+# Local Docker runner — Bonkey-Apps org layer
 
-A containerised **self-hosted GitHub Actions runner** you can host from a Mac
-with Docker Desktop. It registers at the **organisation** layer
+A containerised **self-hosted GitHub Actions runner** you can host from any
+machine running Docker. The image is `linux/amd64`, so the host OS only has to
+run Docker — it is currently deployed on Windows 11 under Docker Desktop. It registers at the **organisation** layer
 (`https://github.com/Bonkey-Apps`), so it can serve CI for **any** Bonkey-Apps
 repo (Puzzles / Cards / Math), not just one.
 
@@ -47,14 +48,14 @@ ARG plus its `RUN` line when a repo adopts a new pin (BC-132 did this for
 
 | ✅ Runs here | ❌ Not here |
 |---|---|
-| typecheck, lint, format, `pnpm -r test` | **Android emulator / Maestro (Tier 4)** — needs `/dev/kvm`, which Docker Desktop on macOS does **not** expose. Keep those on the GCE `kvm`-labelled runners. |
+| typecheck, lint, format, `pnpm -r test` | **Android emulator / Maestro (Tier 4)** — needs `/dev/kvm`, which Docker Desktop does **not** expose (on macOS or Windows). Keep those on the GCE `kvm`-labelled runners. |
 | `expo export -p web` + pack-diff oracle | **GPU / SDXL sprite-gen (diffusion) jobs** — graphics-env + NVIDIA-CUDA only; stays on the GCE graphics runner. |
 | Tier 3 web-local Playwright e2e (Chromium) | Anything requiring nested virtualisation or a real device |
 | Android **build** jobs — Gradle `bundleRelease` (no emulator) | |
 
 ## Prerequisites
 
-- **Docker Desktop for Mac** (Apple Silicon or Intel).
+- **Docker Desktop** — macOS (Apple Silicon or Intel), Windows, or Linux.
 - On **Apple Silicon**, enable **Settings → General → "Use Rosetta for x86/amd64
   emulation"** — the default build runs `linux/amd64` so the runner reports the
   `x64` label the repo's jobs require (`runs-on: [self-hosted, linux, x64]`).
@@ -101,11 +102,11 @@ docker compose down
 
 ## Local build (behind a corporate TLS-inspecting proxy)
 
-If your Mac sits behind a corporate proxy that MITMs HTTPS (Netskope, Zscaler,
+If your machine sits behind a corporate proxy that MITMs HTTPS (Netskope, Zscaler,
 Palo Alto, etc. — check `security find-certificate -a
 /Library/Keychains/System.keychain` for names like your company's), the
 **committed** `Dockerfile` will fail: the container's OS trust store doesn't
-know about the proxy's re-signing CA that your Mac already trusts. Both apt/curl
+know about the proxy's re-signing CA that your host already trusts. Both apt/curl
 downloads at build time *and* the runner binary itself at runtime need this.
 `docker compose pull` (GHCR) sidesteps the problem entirely if the image is
 published — try that first.
@@ -114,7 +115,9 @@ If you must build locally, **never edit the committed `Dockerfile`** with
 machine-specific trust — it's shared by the whole org and any dev without your
 proxy. Instead:
 
-1. Export your Mac's trusted root CAs to a local, gitignored file:
+1. Export the host's trusted root CAs to a local, gitignored file (the
+   command below is macOS; on Windows use `certutil -generateSSTFromWU` or
+   export from `certmgr.msc`):
    ```bash
    security find-certificate -a -p /Library/Keychains/System.keychain \
      > docker-runner/system-roots.pem.local-build-only
@@ -284,5 +287,5 @@ The GCE fleet (`gcp-runner/`) remains the primary, always-available CI
 capacity (persistent Spot VM + on-demand ephemeral JIT VMs), including the
 **Android/KVM** tier this container cannot serve. This local Docker runner is a
 **supplementary, zero-cloud-cost** option for burst capacity or offline/local
-CI from a Mac — it does not replace the GCE runners or change the GCP quota
+CI from a developer machine — it does not replace the GCE runners or change the GCP quota
 discipline in the root `CLAUDE.md`.
