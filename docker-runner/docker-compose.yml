@@ -1,4 +1,4 @@
-# Bonkey Apps — local (Mac) self-hosted org runner.
+# Bonkey Apps — local self-hosted org runner.
 #
 #   cp .env.example .env   # fill in GH_PAT
 #   docker compose up --build -d
@@ -48,9 +48,9 @@ x-runner-base: &runner
     # nproc=2 in each). That is why extra runners are separate SERVICES with
     # their own cpuset rather than replicas. Do NOT use --scale here.
     #
-    # Core-index string, e.g. "0-1" = 2 cores, "0-3" = 4 cores — keep
+    # Core-index string, e.g. "0-1" = 2 cores, "0-5" = 6 cores -- keep
     # BONKEY_NATIVE_BUILD_JOBS's default in entrypoint.sh in lockstep with
-    # however many cores EACH service pins (currently 2).
+    # however many cores EACH service pins (currently 6).
     # --- Memory ------------------------------------------------------------
     # Runners ran with NO memory limit until now, so an overrunning build was
     # killed by the VM-WIDE OOM killer, which picks its own victim: the other
@@ -117,21 +117,46 @@ x-runner-base: &runner
     # privilege, so treat that as unknown rather than as "it is off". The host
     # free figure above is measured with whatever is actually running.
     #
-    # If a build OOMs at 12g, do NOT raise again -- the next lever is reducing
-    # RESIDENCY (fewer/smaller daemons) or narrowing RUNNER_CPUSET so nproc
-    # bounds ninja. See rules/build-concurrency.md in bonkey-org.
+    # REDUCED 12g -> 8g and 12 cores -> 6 by owner decision, 2026-09-04, as part
+    # of shrinking the Docker VM itself to 10 GB / 6 CPUs (see ~/.wslconfig).
+    #
+    # The container cannot stay at 12g once the VM is 10 GB -- 2 GB has to be
+    # left for the VM kernel and the Docker daemon, or the container can claim
+    # the whole VM and reinstate the VM-wide OOM this per-container limit
+    # exists to prevent (see the top of this block).
+    #
+    # 8g IS THE LIMIT THAT OOM-KILLED TWICE (BI-27). It is safe now only
+    # because of the CORE cut, and that dependency must not be forgotten:
+    # HALVING THE CORES HALVES THE COMPILERS. ninja takes -j from nproc, so
+    # 6 cores yields ~7 concurrent clang++ rather than 14. Reprojecting the
+    # MEASURED Cards peak:
+    #
+    #   JVMs      4621 MB   (unchanged -- daemons do not scale with cores)
+    #   clang++   1687 MB   ( 7 x 241 MB, down from 14 x 241 = 3378 MB)
+    #             -------
+    #             6308 MB   = 77% of 8192 MB
+    #
+    # against 8003 MB = 98% of the SAME 8 GiB limit at 12 cores. Identical
+    # limit, 21 points of headroom bought purely by halving the cores.
+    #
+    # SO: do not widen RUNNER_CPUSET back to 0-11 at this mem_limit. That
+    # combination is exactly the one that failed twice.
+    #
+    # If a build OOMs at 8g, do NOT raise it back -- the next lever is reducing
+    # RESIDENCY (fewer/smaller daemons). See rules/build-concurrency.md in
+    # bonkey-org: serialising bounds execution, not residency.
     #
     # NOTE the same trap documented below for the JVM applies to Node, and Node
     # is what died: runtimes here size themselves from the VM's 15.31 GiB, not
     # from this limit. Node happens to default to ~4 GiB so the arithmetic above
     # holds, but nothing ENFORCES it. If this recurs, cap it explicitly with
     # NODE_OPTIONS=--max-old-space-size=<MiB> rather than raising mem_limit again.
-    mem_limit: ${RUNNER_MEM_LIMIT:-12g}
+    mem_limit: ${RUNNER_MEM_LIMIT:-8g}
     # Equal to mem_limit == container swap disabled. The VM has only 4 GiB of
     # swap in total, so letting each runner swap its whole limit would oversell
     # it several times over and trade a fast, legible OOM for host-wide
     # thrashing -- the "job died at ~600s, log says nothing" failure mode.
-    memswap_limit: ${RUNNER_MEM_LIMIT:-12g}
+    memswap_limit: ${RUNNER_MEM_LIMIT:-8g}
     # Ephemeral runners exit after one job; restart to pick up the next.
     restart: ${RUNNER_RESTART:-unless-stopped}
     stop_grace_period: 90s
@@ -173,18 +198,20 @@ x-runner-base: &runner
 services:
   runner:
     <<: *runner
-    cpuset: "${RUNNER_CPUSET:-0-1}"
+    cpuset: "${RUNNER_CPUSET:-0-5}"
 
   # Extra runners, off by default so a 2-core laptop keeps the single-runner
   # behaviour with no flags. Each pins its OWN cores, so they run genuinely in
   # parallel instead of contending.
   #
-  # These stay at 2 cores each even on a 24-core host, because cores are
-  # priced in MEMORY: ninja takes its -j from `nproc`, so every core added to a
-  # runner buys another concurrent clang++ (~1 GiB each) inside the same
-  # mem_limit. Widening is a real option -- it just needs the per-core peak
-  # measured on the box first, and BONKEY_NATIVE_BUILD_JOBS in entrypoint.sh
-  # moved in lockstep. Do not widen on core count alone:
+  # Extra runners stay narrow because cores are priced in MEMORY: ninja
+  # takes its -j from `nproc`, so every core added buys another concurrent
+  # clang++ inside the same mem_limit. MEASURED 2026-08-28 from a kernel
+  # OOM process table: a clang++ averages 241 MiB, max 678 -- NOT the
+  # ~1 GiB previously assumed here, which was a guess and was 4x out.
+  # Widening is a real option -- it needs the per-core peak measured first,
+  # and BONKEY_NATIVE_BUILD_JOBS in entrypoint.sh moved in lockstep.
+  # Do not widen on core count alone:
   #   docker compose --profile x2 up -d   # 2 runners: cores 0-1, 2-3
   #   docker compose --profile x3 up -d   # 3 runners: adds cores 4-5
   # Check the host has the cores first (`docker info --format '{{.NCPU}}'`)
