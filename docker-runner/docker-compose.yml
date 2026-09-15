@@ -146,11 +146,15 @@ x-runner-base: &runner
     # RESIDENCY (fewer/smaller daemons). See rules/build-concurrency.md in
     # bonkey-org: serialising bounds execution, not residency.
     #
-    # NOTE the same trap documented below for the JVM applies to Node, and Node
-    # is what died: runtimes here size themselves from the VM's 15.31 GiB, not
-    # from this limit. Node happens to default to ~4 GiB so the arithmetic above
-    # holds, but nothing ENFORCES it. If this recurs, cap it explicitly with
-    # NODE_OPTIONS=--max-old-space-size=<MiB> rather than raising mem_limit again.
+    # CORRECTED 2026-09-15 (BI-55). This note used to say Node, like the JVM,
+    # sizes itself from the VM rather than this limit, and defaults to ~4 GiB.
+    # Neither is true today. Measured inside this container (cgroup v2), V8's
+    # heap_size_limit scales with the container and flattens near 2.2 GiB:
+    #   -m 1g -> 524 MiB   2g -> 1048   4g -> 2096   8g -> 2240 MiB
+    # So the "~4 GiB bundler heap" line in the 8g arithmetic above was an
+    # overestimate. NODE_OPTIONS below now pins that ceiling explicitly (see there).
+    # If a build OOMs, do NOT raise it: NODE_OPTIONS reaches every node process
+    # in the container, so a raise multiplies across jest workers.
     mem_limit: ${RUNNER_MEM_LIMIT:-8g}
     # Equal to mem_limit == container swap disabled. The VM has only 4 GiB of
     # swap in total, so letting each runner swap its whole limit would oversell
@@ -167,8 +171,18 @@ x-runner-base: &runner
       RUNNER_LABELS: ${RUNNER_LABELS:-}
       RUNNER_GROUP: ${RUNNER_GROUP:-Default}
       RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-true}
-      # Absolute -Xmx, deliberately not a percentage. Measured on Docker
-      # Desktop/WSL2 2026-08-23: a JDK 17 JVM in this image reports
+      # CORRECTED 2026-09-15 (BI-55): the 2026-08-23 measurement below no longer
+      # describes this machine. Re-measured in the live container (cgroup v2):
+      # JVM MaxHeapSize = exactly 25% of the limit (1g -> 256 MiB, 2g -> 512,
+      # 4g -> 1024, 8g -> 2048), i.e. the JVM DOES honour the container now.
+      # Hypothesis, unverified: Docker Desktop moved WSL2 from a cgroup v1
+      # layout to v2 in between. The absolute -Xmx is KEPT regardless -- it is
+      # a working guardrail, and dropping it needs a deliberate re-derivation.
+      # Note it does not bound the Gradle daemon when a product writes
+      # org.gradle.jvmargs (Math sets -Xmx4g, hence BI-56's 5,263 MiB JVM).
+      #
+      # Original note, as measured 2026-08-23: Docker
+      # Desktop/WSL2: a JDK 17 JVM in this image reports
       # UseContainerSupport=true and reads the right cgroup value, yet still
       # sizes its heap from the VM's 15.31 GiB rather than the container limit
       # -- `-m 1g`, `-m 2g` and `-m 4g` ALL yielded a 3920 MiB max heap, and
@@ -194,6 +208,20 @@ x-runner-base: &runner
       #
       # Set to an empty string in .env to opt out entirely.
       JAVA_TOOL_OPTIONS: ${RUNNER_JAVA_TOOL_OPTIONS--Xmx2g}
+      # Explicit V8 old-space cap (BI-55). 2048 reproduces TODAY's implicit
+      # ceiling exactly -- measured in this container, --max-old-space-size=2048
+      # gives heap_size_limit 2240 MiB, identical to the unset default at 8g --
+      # so this changes no behaviour. It exists so the ceiling is a stated value
+      # rather than a V8 heuristic that moves with the next Node or Docker update.
+      #
+      # It applies to EVERY node process here: Metro, each jest worker, and
+      # the runner's own JS actions. Raising it raises all of them at once, and
+      # the products' worker-cap derivations do not know it exists. A job that
+      # needs more heap for one process sets NODE_OPTIONS in its own workflow
+      # step AND lowers its worker count so N x heap still fits the limit.
+      # A per-process flag (node --max-old-space-size=...) overrides this.
+      # Set to an empty string in .env to opt out.
+      NODE_OPTIONS: ${RUNNER_NODE_OPTIONS---max-old-space-size=2048}
 
 services:
   runner:
