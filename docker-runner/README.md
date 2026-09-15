@@ -150,9 +150,28 @@ A per-container `mem_limit` makes the overrun land on the container that caused
 it: `docker inspect -f '{{.State.OOMKilled}}' <container>` says so plainly, and
 the ephemeral restart brings a clean runner straight back.
 
-`mem_limit` must not ship alone, because **the JVM does not size its heap from
-the container limit on Docker Desktop/WSL2.** Measured 2026-08-23 with this
-image, `UseContainerSupport=true` and the correct cgroup value visible inside:
+> **Corrected 2026-09-15 (BI-55).** The table below no longer describes this
+> machine. Re-measured in the live container on cgroup v2, both runtimes scale
+> with the limit:
+>
+> | container `-m` | JVM default max heap | V8 `heap_size_limit` |
+> |---|---|---|
+> | 1g | 256 MiB | 524 MiB |
+> | 2g | 512 MiB | 1048 MiB |
+> | 4g | 1024 MiB | 2096 MiB |
+> | 8g | 2048 MiB | 2240 MiB |
+>
+> The JVM sits at exactly 25% (default `MaxRAMPercentage`). The likely cause is a
+> Docker Desktop move from a cgroup v1 layout to v2; that is a hypothesis, not
+> verified. The absolute `-Xmx` below is kept as a guardrail. Node is now pinned
+> explicitly with `NODE_OPTIONS=--max-old-space-size=2048`, which reproduces the
+> 2240 MiB ceiling exactly. It applies to every node process, so do not raise it
+> container-wide; opt out with `RUNNER_NODE_OPTIONS=` (empty) in `.env`.
+
+Original reasoning, kept for history: `mem_limit` must not ship alone, because
+**the JVM does not size its heap from the container limit on Docker
+Desktop/WSL2.** Measured 2026-08-23 with this image, `UseContainerSupport=true`
+and the correct cgroup value visible inside:
 
 | container `-m` | cgroup `memory.max` | JVM default max heap |
 |---|---|---|
