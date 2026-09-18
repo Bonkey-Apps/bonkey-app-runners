@@ -213,3 +213,93 @@ script installs a host-level readers/writer lock (`ACTIONS_RUNNER_HOOK_JOB_START
 an emulator job (`HOST_LOCK_MODE=exclusive`, or inferred from `GITHUB_JOB`
 since job-level `env:` isn't forwarded to the hook) takes an exclusive lock
 that drains regular jobs first, then blocks new ones until it finishes.
+
+## Shared rules (`.claude/rules/`)
+
+This file covers the whole repo and loads every session. Area-specific rules
+live in `.claude/rules/*.md`, each scoped with `paths:` frontmatter.
+
+The three below are **shared org rules, not local ones.** The primary copy is
+`bonkey-org/rules/` on branch `master` (ADR-0007) and they are restaged here
+unchanged. **Change them upstream, never here** — patching a downstream copy
+and letting it drift is exactly how `memory-vault.md` ended up with three
+incompatible versions.
+
+| Rule file | Applies to (`paths:`) | Covers |
+|---|---|---|
+| `.claude/rules/agent-liveness.md` | `**` | gates run synchronously, never backgrounded; verify the artifact, not the report |
+| `.claude/rules/agent-worktrees.md` | `**` | worktree isolation and the shared-object-store hazard |
+| `.claude/rules/memory-vault.md` | `**` | the `bonkey-memories` vault — read before exploring, write back what lasts |
+
+## Tracking
+
+Work on this repo is tracked in Jira project **BI** ("Bonkey Infra"), the same
+board that covers CI, DNS and Brave policy. There is no separate runner
+project. Write descriptions in markdown; mixing Jira wiki markup renders
+literally, and filter BI by status **name**, never by `statusCategory`.
+
+## Docs tree
+
+There is no `docs/` directory here. Each document sits next to the thing it
+describes, and that is the canonical written record for this repo:
+
+| Path | What |
+|---|---|
+| `README.md` | repo overview and entry point |
+| `docker-runner/README.md` | the containerised org-level runner |
+| `gcp-runner/README.md` | Terraform layout, roots and environments |
+| `gcp-runner/SETUP-OWNER.md` | one-time owner setup |
+| `gcp-runner/IMAGE-MANIFEST.md` | auditable record of the baked toolchain |
+| `gcp-runner/scripts/README.md` | the on-demand runner scripts |
+| `gcp-runner/environments/bonkey-puzzles/README.md` | that environment's root |
+
+Architecture decisions are **not** kept here — ADRs live in `bonkey-org` under
+`docs/adr/`.
+
+## Worktrees and the primary checkout
+
+The shared primary checkout is
+`C:/Users/famla/Documents/Git/bonkey-apps/bonkey-app-runners`, default branch
+**`main`**. Worker agents never edit it — cut a sibling worktree
+`C:/Users/famla/Documents/Git/bonkey-apps/wt-<slug>` from `origin/main` and work
+there. That path is also what the liveness rule's "check the shared primary
+checkout is clean" step points at. `origin` is SSH
+(`git@github.com:Bonkey-Apps/bonkey-app-runners.git`).
+
+## Gates — what the acceptance oracle actually is here
+
+**This repo has no test suite, no linter, and no `package.json`.** Do not go
+hunting for `pnpm test` / `typecheck` / `lint` / `format:check` — those are the
+app repos' gates, which `.claude/rules/agent-liveness.md` uses as its examples.
+There is no equivalent here, and neither workflow
+(`build-docker-runner-image.yml`, `deploy-gcp-runner.yml`) lints this repo's
+shell or Terraform.
+
+So the liveness rule's "verify the artifact, not the report" resolves to the
+**live system**:
+
+- Terraform change → `terraform plan` in the root you actually edited, and read
+  the plan. Remember the root config and `modules/runner-mig/` are near-duplicates.
+- Runner image change → confirm the change is inside the *running container*,
+  not just pulled: `docker inspect -f '{{.Image}}' docker-runner-runner-1`
+  against `docker images`, then `docker exec … ls /opt/pw-browsers`.
+- Runner health → a runner actually picking up a job. A green workflow run is a
+  rollup and can contain a skipped job.
+
+Name in your report exactly what you ran and what you could not verify. An
+unverified fix is reported as unverified, never as success.
+
+## Cross-session memory (the Obsidian vault)
+
+Containers here are ephemeral, so anything an agent learns the hard way is lost
+unless written outside the container. **`bonkey-memories`**
+(`https://github.com/bonkey-apps/bonkey-memories`, normally at
+`/workspace/bonkey-memories`) is a git-backed Obsidian vault holding that
+cross-session knowledge: verified commands, gotchas, and approaches already
+tried and rejected.
+
+It is a memory aid, **not** a system of record — ADRs stay in `bonkey-org/docs/adr/`,
+canonical specs in the docs tree above, work-item status in Jira **BI**, and no
+secrets go in it at all (this repo handles PATs and GCP credentials — record
+that a credential is needed and where it comes from, never its value).
+`.claude/rules/memory-vault.md` has the full contract.
