@@ -207,23 +207,32 @@ use sites, not the configured variables.**
 **Node 26 needs `libatomic1` (BI-66).** NodeSource `node_26.x` declares
 `Depends: libatomic1 (>= 4.8)`; `node_24.x` does not, and the official Node 26
 linux-x64 binary fails with `libatomic.so.1: cannot open shared object file`
-without it. The Docker image now carries it, so Node 26 **via `setup-node`**
-works there; the baked Node stays 24 (the shared `setup-js` defaults to `"24"`).
-**Open gap:** the three GCE startup scripts do not install it —
-`gcp-runner/runner-startup.sh.tftpl`,
-`gcp-runner/modules/runner-mig/runner-startup.sh.tftpl` and
-`gcp-runner/scripts/runner-jit-startup.sh` (GCE changes are owner-gated).
-Whether the GCE base image already ships `libatomic1` was not checked, so treat
-Node 26 on GCE as unverified, not as known-broken. Two further traps found on
-the way:
+without it. The Docker image carries it from `v1.3.0`, so only a runner rolled
+onto that image has it. In a local build of that image the Node 26 binary
+`setup-node` installs runs; the `setup-node` step itself is first exercised by a
+consuming repo's first Node 26 job. The baked Node stays 24 (the shared
+`setup-js` defaults to `"24"`).
 
-- The `setup-node` toolcache survives the per-job recycle but is emptied by
-  `docker compose up -d --force-recreate`, so the first job after a recreate
-  re-downloads.
+**GCE is unverified, not known-broken.** None of the three GCE startup scripts
+installs `libatomic1` by name. The two `runner-startup.sh.tftpl` copies (root
+and `modules/runner-mig/`) install `build-essential`, which on their Debian 12
+base pulls it in as a hard dependency (`gcc` → `gcc-12` → `libgcc-12-dev` →
+`libatomic1`), so they very likely have it already.
+`gcp-runner/scripts/runner-jit-startup.sh` installs no compiler, so it has it
+only if the `debian-12` image ships it, which was not checked — that script is
+the open gap. None of this was checked on a VM (GCE changes are owner-gated).
+
+Two further traps found on the way:
+
+- The `setup-node` toolcache (`_work/_tool`, in the container's writable layer)
+  survives the per-job recycle but is emptied whenever the container is
+  recreated — `up -d` onto a newly pulled image, or `--force-recreate` — so the
+  first job after a roll re-downloads.
 - **This repo cannot test the runner it builds.** It is public and the runner
-  group has `allows_public_repositories=false`, so a probe workflow here queues
-  forever and never runs. Verify runner changes from a consuming app repo, or
-  locally against a test-tagged image build.
+  group has `allows_public_repositories=false`, so a probe workflow here is
+  never picked up (the BI-66 probe sat queued with no runner until cancelled).
+  Verify runner changes from a consuming app repo, or locally against a
+  test-tagged image build.
 
 ### Host readers/writer lock (GCE, KVM/emulator jobs)
 
