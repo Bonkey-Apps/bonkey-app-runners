@@ -204,6 +204,27 @@ single Cards workflow file — `CI_RUNNER` falls back to `ubuntu-latest` while
 `CI_RUNNER_LINUX` falls back to `self-hosted`. **Enumerate the fallbacks at the
 use sites, not the configured variables.**
 
+**Node 26 needs `libatomic1` (BI-66).** NodeSource `node_26.x` declares
+`Depends: libatomic1 (>= 4.8)`; `node_24.x` does not, and the official Node 26
+linux-x64 binary fails with `libatomic.so.1: cannot open shared object file`
+without it. The Docker image now carries it, so Node 26 **via `setup-node`**
+works there; the baked Node stays 24 (the shared `setup-js` defaults to `"24"`).
+**Open gap:** the three GCE startup scripts do not install it —
+`gcp-runner/runner-startup.sh.tftpl`,
+`gcp-runner/modules/runner-mig/runner-startup.sh.tftpl` and
+`gcp-runner/scripts/runner-jit-startup.sh` (GCE changes are owner-gated).
+Whether the GCE base image already ships `libatomic1` was not checked, so treat
+Node 26 on GCE as unverified, not as known-broken. Two further traps found on
+the way:
+
+- The `setup-node` toolcache survives the per-job recycle but is emptied by
+  `docker compose up -d --force-recreate`, so the first job after a recreate
+  re-downloads.
+- **This repo cannot test the runner it builds.** It is public and the runner
+  group has `allows_public_repositories=false`, so a probe workflow here queues
+  forever and never runs. Verify runner changes from a consuming app repo, or
+  locally against a test-tagged image build.
+
 ### Host readers/writer lock (GCE, KVM/emulator jobs)
 
 Each GCE VM can run multiple runner agents (`runners_per_vm`), but only one
