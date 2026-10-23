@@ -86,9 +86,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # --- CI base: OS deps + search tools (all repos) ---------------------------
 RUN set -eux; \
     apt-get update -q; \
+    # libatomic1 (BI-66): Node 26 needs it — NodeSource node_26.x Depends: libatomic1 (>= 4.8), node_24.x doesn't, and the official 26 linux-x64 binary fails with "libatomic.so.1: cannot open shared object file" without it.
     apt-get install -y -q --no-install-recommends \
         ca-certificates curl git jq ripgrep fd-find python3 \
-        unzip tar sudo gnupg libicu74 libssl3; \
+        unzip tar sudo gnupg libicu74 libssl3 libatomic1; \
     # GitHub CLI (gh) from the official apt repo (pinned channel, keyring-verified).
     mkdir -p /etc/apt/keyrings; \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
